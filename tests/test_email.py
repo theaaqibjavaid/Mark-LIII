@@ -287,6 +287,33 @@ class TestReadEmails:
             result = read_emails({"keyword": "from john"})
             assert "Hello" in result
 
+    def test_keyword_fallback_when_imap_search_fails(self, valid_config):
+        """When IMAP SEARCH returns nothing, Python fallback scans all emails."""
+        with patch("actions.email.IMAP4_SSL") as MockIMAP:
+            mock_mail = MagicMock()
+            MockIMAP.return_value = mock_mail
+            # ALL returns 20 emails as a single space-separated bytes object (real IMAP format)
+            mock_mail.search.side_effect = [
+                ("OK", [b"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"]),
+                ("OK", [b""]),  # TEXT
+                ("OK", [b""]),  # SUBJECT
+                ("OK", [b""]),  # BODY
+                ("OK", [b""]),  # FROM
+            ]
+            # Only email #15 has the keyword
+            def fetch_side_effect(msg_id, *args):
+                if msg_id == b"15":
+                    return ("OK", [(b"15", b"From: boss@test.com\r\nSubject: Urgent\r\n\r\nThis is urgent")])
+                return ("OK", [(msg_id, b"From: a@test.com\r\nSubject: Normal\r\n\r\nRegular email")])
+            mock_mail.fetch.side_effect = fetch_side_effect
+            mock_mail.logout = MagicMock()
+
+            result = read_emails({"keyword": "urgent"})
+            assert "Urgent" in result
+            # Verify it scanned beyond the last 10 emails
+            fetch_ids = [c[0][0] for c in mock_mail.fetch.call_args_list]
+            assert b"15" in fetch_ids
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # configure_email

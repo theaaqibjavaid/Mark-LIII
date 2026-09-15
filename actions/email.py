@@ -243,17 +243,20 @@ def read_emails(
                     continue
 
             if keyword_ids:
+                # IMAP search succeeded — use those results
                 keyword_id_set = set(keyword_ids)
-                # Intersect with all inbox IDs to stay valid
                 recent_ids = [mid for mid in msg_ids if mid in keyword_id_set]
                 if recent_ids:
                     recent_ids = recent_ids[-limit:]
                     recent_ids.reverse()
                 else:
-                    # No overlap with inbox — use keyword results directly
                     recent_ids = keyword_ids[-limit:]
                     recent_ids.reverse()
                 keyword_ids_found = True
+            else:
+                # IMAP search failed (server doesn't support it) — fall back
+                # to scanning ALL emails, not just the last `limit`
+                recent_ids = list(reversed(msg_ids))  # all emails, newest first
 
         results = []
         for msg_id in recent_ids:
