@@ -1,9 +1,13 @@
 import asyncio
 import json
+import re
+from pathlib import Path
+
 import pytest
 
+from core.email.errors import TimeoutError
 from core.email.mime import OutboundAttachment, build_outbound_message
-from core.email.models import EmailAccount, EmailAddress, EmailOperationResult, EmailMessageRef, OperationStatus
+from core.email.models import EmailAccount, EmailAddress, EmailOperationResult, OperationStatus
 from core.email.providers.base import Capability, ProviderCapabilities
 from core.email.service import EmailService
 
@@ -69,6 +73,17 @@ def test_mime_sanitizes_path_traversal_and_control_characters_in_attachment_file
     assert b"../../secret" not in raw
 
 
+def test_mime_rejects_oversized_attachment():
+    with pytest.raises(ValueError):
+        build_outbound_message(
+            sender=EmailAddress("me@example.com"),
+            recipients=[EmailAddress("you@example.com")],
+            subject="hello",
+            body_plain="hello",
+            attachments=[OutboundAttachment("large.bin", b"x" * (26 * 1024 * 1024))],
+        )
+
+
 def test_concurrent_same_idempotency_key_executes_provider_only_once():
     async def scenario():
         provider = SendProvider()
@@ -111,3 +126,34 @@ def test_untrusted_email_content_never_becomes_action_authorization():
         )
     )
     assert payload["ok"] is False or payload.get("error") is not None
+
+
+def test_imap_smtp_network_wrappers_have_finite_timeouts():
+    source = Path("core/email/providers/imap_smtp.py").read_text(encoding="utf-8")
+    assert re.search(r"_DEFAULT_CONNECT_TIMEOUT\s*=\s*[1-9][0-9]*", source)
+    assert re.search(r"_DEFAULT_COMMAND_TIMEOUT\s*=\s*[1-9][0-9]*", source)
+    assert re.search(r"_DEFAULT_SEND_TIMEOUT\s*=\s*[1-9][0-9]*", source)
+    assert source.count("timeout=_DEFAULT_COMMAND_TIMEOUT") >= 5
+    assert source.count("timeout=_DEFAULT_CONNECT_TIMEOUT") >= 3
+    assert "timeout=_DEFAULT_SEND_TIMEOUT" in source
+
+
+def test_connect_timeout_is_normalized_to_typed_timeout_error():
+    from unittest.mock import patch
+    from core.email.providers.imap_smtp import ImapSmtpProvider
+
+    account = EmailAccount("a1", "generic", primary_address=EmailAddress("me@example.com"))
+
+    async def timeout_run(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    class Credentials:
+        def get_password(self, *args, **kwargs):
+            return "pw"
+
+    async def scenario():
+        with patch("core.email.providers.imap_smtp._run_sync", timeout_run):
+            with pytest.raises(TimeoutError):
+                await ImapSmtpProvider(imap_host="imap.example.com").connect(account, Credentials())
+
+    asyncio.run(scenario())
