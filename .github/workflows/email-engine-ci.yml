@@ -15,6 +15,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
 
@@ -31,21 +32,27 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest pytest-cov
+          pip install -r requirements.txt
+          pip install pytest pytest-cov coverage
 
-      - name: Run full test suite with coverage
+      - name: Run full test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
-          pytest --cov=core --cov=actions --cov-report=term-missing --cov-report=xml
+          xvfb-run -a pytest -q
+
+      - name: Run email coverage report
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          xvfb-run -a coverage run --source=core/email -m pytest -q tests/email
+          coverage report --fail-under=80
+          coverage xml -o coverage.xml
 
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-${{ matrix.python-version }}
+          name: email-coverage-${{ matrix.python-version }}
           path: coverage.xml
           if-no-files-found: ignore
-
-      - name: Run email-engine focused suite
-        run: |
-          pytest tests/email -q
