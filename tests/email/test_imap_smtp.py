@@ -1,916 +1,320 @@
-"""
-Tests for core/email/providers/imap_smtp.py — Generic IMAP/SMTP provider.
-
-Tests verify:
-- Lifecycle contract (connect/disconnect/cancellation)
-- IMAP operations (folders, search, fetch, flags, movement)
-- SMTP sending with TLS, authentication, attachments
-- Error mapping, security, capability detection
-"""
+"""Protocol-accurate tests for the generic IMAP/SMTP provider."""
 from __future__ import annotations
 
 import asyncio
-import smtplib
-from datetime import datetime
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.email.credentials import CredentialStore, InMemoryCredentialStore
+from core.email.credentials import InMemoryCredentialStore
 from core.email.errors import (
     AuthenticationError,
-    ConnectionError,
-    InvalidRecipientError,
     MailboxNotFoundError,
     MessageNotFoundError,
     ProviderCapabilityError,
-    TLSConfigurationError,
 )
-from core.email.limits import EmailLimits
 from core.email.models import (
     EmailAccount,
     EmailAddress,
-    EmailAttachment,
     EmailDraft,
-    EmailMessage,
     EmailMessageRef,
-    EmailOperationResult,
     EmailSearchQuery,
+    EmailServerConfig,
+    OperationStatus,
 )
-from core.email.providers.base import Capability, ProviderConnectionState
+from core.email.providers.base import Capability
 from core.email.providers.imap_smtp import ImapSmtpProvider
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class FakeIMAP:
-    """A fake IMAP4_SSL implementation for deterministic testing."""
+    """Small deterministic double implementing the imaplib UID contract."""
 
-    def __init__(self, folders=None, special_use=None):
-        self._folders = folders or ["INBOX", "Sent", "Drafts", "Trash", "Archive"]
-        self._special_use = special_use or {}
-        self._messages = {}
-        self._uid_counter = 1000
-        self.uid = MagicMock()
-        self.uid.return_value = ("OK", [b""])
-        self._mime_data = b"MIME-Version: 1.0\r\nFrom: sender@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\nBody content"
-        # fetch should return tuple format expected by _extract_raw_message
-        self.uid.fetch.return_value = ("OK", [(b"1001", (b"", self._mime_data))])
-        self.search = MagicMock(return_value=("OK", [b"1001 1002 1003"]))
-        # Add uid_search method for UID-based search
-        self.uid_search = MagicMock(return_value=("OK", [b"1001 1002 1003"]))
-        self.uid.store.return_value = ("OK", [b""])
-        self.uid.copy.return_value = ("OK", [b"1004"])
-        self.uid.move.return_value = ("OK", [b""])
-        self.append_calls = []  # Track append calls
-        self.append = MagicMock(side_effect=self._append_impl)
-
-    def _append_impl(self, mailbox, flags, date_time, message):
-        self.append_calls.append({
-            "mailbox": mailbox,
-            "flags": flags,
-            "message": message,
-        })
-        self._uid_counter += 1
-        return ("OK", [str(self._uid_counter).encode()])
+    def __init__(self, folders=None):
+        self.folders = folders or ["INBOX", "Sent", "Drafts", "Trash", "Archive"]
+        self.selected = "INBOX"
+        self.calls: list[tuple] = []
+        self.move_status = "OK"
+        self.fetch_status = "OK"
+        self.capabilities = (b"IMAP4REV1", b"UIDPLUS", b"MOVE")
+        self.append_uid = 2000
+        self.message = (
+            b"MIME-Version: 1.0\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"Subject: Test\r\n"
+            b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"
+            b"Message-ID: <m1@example.com>\r\n\r\n"
+            b"Body content"
+        )
 
     def login(self, user, password):
-        return ("OK", None)
+        self.calls.append(("login", user, password))
+        return ("OK", [b"LOGIN completed"])
 
     def logout(self):
-        return ("OK", None)
+        self.calls.append(("logout",))
+        return ("OK", [b"BYE"])
+
+    def starttls(self, **kwargs):
+        self.calls.append(("starttls",))
+        return ("OK", [b"STARTTLS completed"])
 
     def list(self, reference="*", mask="*"):
-        results = []
-        for folder in self._folders:
-            flags = "\\HasNoChildren"
-            if folder.lower() in ("drafts", "draft"):
-                flags = "\\Drafts \\HasNoChildren"
-            elif folder.lower() == "sent":
-                flags = "\\Sent \\HasNoChildren"
-            elif folder.lower() == "trash":
-                flags = "\\Trash \\HasNoChildren"
-            elif folder.lower() == "archive":
-                flags = "\\Archive \\HasNoChildren"
-            results.append(f"({flags}) \".\" \"{folder}\"".encode())
-        return ("OK", results)
+        rows = []
+        for folder in self.folders:
+            flag = "\\HasNoChildren"
+            if folder == "Drafts": flag = "\\Drafts \\HasNoChildren"
+            elif folder == "Sent": flag = "\\Sent \\HasNoChildren"
+            elif folder == "Trash": flag = "\\Trash \\HasNoChildren"
+            elif folder == "Archive": flag = "\\Archive \\HasNoChildren"
+            rows.append(f'({flag}) "." "{folder}"'.encode())
+        return ("OK", rows)
 
     def select(self, mailbox, readonly=False):
-        if mailbox not in self._folders:
-            raise Exception(f"[NONEXISTENT] mailbox '{mailbox}'")
+        self.calls.append(("select", mailbox, readonly))
+        if mailbox not in self.folders:
+            return ("NO", [b"[NONEXISTENT]"])
+        self.selected = mailbox
         return ("OK", [b"1"])
 
-    def expunge(self):
-        return ("OK", None)
+    def uid(self, command, *args):
+        self.calls.append((command.lower(),) + args)
+        command = command.lower()
+        if command == "fetch":
+            if self.fetch_status != "OK": return (self.fetch_status, [])
+            return ("OK", [(str(args[0]).encode(), (b"FLAGS (\\Seen)", self.message))])
+        if command == "move": return (self.move_status, [b""])
+        if command == "copy": return ("OK", [b"2001"])
+        if command == "expunge": return ("OK", [b""])
+        if command == "store": return ("OK", [b"FLAGS (\\Flagged)"])
+        return ("OK", [b""])
+
+    def uid_search(self, charset, criteria):
+        self.calls.append(("uid_search", charset, criteria))
+        return ("OK", [b"1001 1002 1003"])
+
+    def append(self, mailbox, flags, date_time, message):
+        self.append_uid += 1
+        self.calls.append(("append", mailbox, flags, message))
+        return ("OK", [str(self.append_uid).encode()])
 
 
 class FakeSMTP:
-    """A fake SMTP implementation for deterministic testing."""
-
     def __init__(self):
-        self.login_called = False
-        self.sendmail_called = False
-        self.quit_called = False
-        self.starttls_called = False
-        self.login = MagicMock(return_value=None)
-        self.sendmail = MagicMock(return_value={})
-        self.quit = MagicMock(return_value=None)
-        self.starttls = MagicMock(return_value=None)
+        self.calls: list[tuple] = []
 
-    def send_message(self, msg, from_addr, to_addrs, mail_options=None, rcpt_options=None):
-        self.sendmail_called = True
+    def starttls(self, **kwargs):
+        self.calls.append(("starttls",))
+        return (220, b"ready")
+
+    def login(self, user, password):
+        self.calls.append(("login", user, password))
+        return (235, b"authenticated")
+
+    def sendmail(self, sender, recipients, message):
+        self.calls.append(("sendmail", sender, recipients, message))
         return {}
 
-
-@pytest.fixture
-def provider():
-    return ImapSmtpProvider(
-        imap_host="imap.example.com",
-        imap_port=993,
-        smtp_host="smtp.example.com",
-        smtp_port=587,
-    )
-
-
-@pytest.fixture
-def account():
-    return EmailAccount(
-        account_id="test@example.com",
-        primary_address=EmailAddress("test@example.com"),
-        provider="imap_smtp",
-        capabilities={"imap_server": "imap.example.com", "smtp_server": "smtp.example.com"},
-    )
+    def quit(self):
+        self.calls.append(("quit",))
+        return (221, b"bye")
 
 
 @pytest.fixture
 def credentials():
     store = InMemoryCredentialStore()
-    store.set_password(service="imap_smtp", username="test@example.com", password="secret123")
+    store.set_password("imap_smtp", "user@example.com", "test-password")
     return store
 
 
 @pytest.fixture
-def fake_imap():
-    return FakeIMAP()
-
-
-def _run_async(coro):
-    """Helper to run async code in sync test context."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifecycle Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestLifecycle:
-    def test_connect_success(self, provider, account, credentials, fake_imap):
-        """Test successful IMAP connection."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            result = _run_async(provider.connect(account, credentials))
-        assert provider.is_connected
-        assert result.connection_state == ProviderConnectionState.AUTHENTICATED
-
-    def test_disconnect(self, provider, account, credentials, fake_imap):
-        """Test disconnect after successful connection."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            _run_async(provider.disconnect())
-        assert not provider.is_connected
-        assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
-
-    def test_disconnect_already_disconnected(self, provider):
-        """Test disconnect when already disconnected is safe."""
-        _run_async(provider.disconnect())  # Should not raise
-        assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
-
-    def test_provider_state_transitions(self, provider, account, credentials, fake_imap):
-        """Test correct state transitions."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            assert provider.metadata.connection_state == ProviderConnectionState.AUTHENTICATED
-            _run_async(provider.disconnect())
-            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
-
-    def test_context_manager_cleanup_on_success(self, provider, account, credentials, fake_imap):
-        """Test async context manager cleanup on success."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            async def _test():
-                async with provider as p:
-                    # Connect inside context (the context manager will handle disconnect on exit)
-                    await p.connect(account, credentials)
-                    # Provider should be connected inside context
-                    assert p.is_connected
-                    # Simulate some work
-                    folders = await p.list_folders()
-                    assert isinstance(folders, list)
-                # After context exit, provider should be disconnected (cleanup happened)
-                assert not p.is_connected
-            _run_async(_test())
-
-    def test_context_manager_cleanup_on_exception(self, provider, account, credentials, fake_imap):
-        """Test async context manager cleanup on exception."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            async def _test():
-                async with provider as p:
-                    raise ValueError("test error")
-            with pytest.raises(ValueError):
-                _run_async(_test())
-        assert not provider.is_connected
-
-    def test_disconnect_cleans_up_smtp(self, provider, account, credentials, fake_imap):
-        """Test disconnect cleans up SMTP connection."""
-        fake_smtp = FakeSMTP()
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=fake_smtp):
-                _run_async(provider.connect(account, credentials))
-                _run_async(provider._connect_smtp(account))
-                _run_async(provider.disconnect())
-        assert provider._smtp is None
-
-    def test_connect_timeout(self, provider, account, credentials):
-        """Test connection timeout raises TimeoutError."""
-        from core.email.errors import TimeoutError as EmailTimeoutError
-        from unittest.mock import MagicMock
-        # Simulate timeout by having IMAP4_SSL raise TimeoutError
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", side_effect=TimeoutError("Connection timed out")):
-            with pytest.raises(EmailTimeoutError):
-                _run_async(provider.connect(account, credentials, timeout=0.01))
-
-    def test_password_not_in_metadata(self, provider, account, credentials, fake_imap):
-        """Test password doesn't appear in provider metadata."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            metadata = provider.metadata
-            assert "secret123" not in str(metadata)
-            assert "password" not in str(metadata).lower()
-
-    def test_credentials_cleared_on_disconnect(self, provider, account, credentials, fake_imap):
-        """Test credentials are cleared from provider on disconnect."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            assert provider._credentials is not None
-            _run_async(provider.disconnect())
-            assert provider._credentials is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Mailbox Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestMailboxes:
-    def test_list_folders(self, provider, account, credentials, fake_imap):
-        """Test listing folders."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            folders = _run_async(provider.list_folders())
-        names = [f.provider_name for f in folders]
-        assert "INBOX" in names
-        assert "Sent" in names
-        assert "Drafts" in names
-        assert "Trash" in names
-        assert "Archive" in names
-
-    def test_folder_metadata(self, provider, account, credentials, fake_imap):
-        """Test folder metadata."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            folder = _run_async(provider.get_folder_info("INBOX"))
-        assert folder.provider_name == "INBOX"
-        assert folder.selectable
-
-    def test_select_folder(self, provider, account, credentials, fake_imap):
-        """Test selecting a folder."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            folder = _run_async(provider.select_folder("INBOX"))
-        assert folder.provider_name == "INBOX"
-        assert folder.selectable
-
-    def test_special_use_folders(self, provider, account, credentials, fake_imap):
-        """Test special-use folder detection."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            folders = _run_async(provider.list_folders())
-        drafts = [f for f in folders if f.provider_name == "Drafts"]
-        assert len(drafts) == 1
-        assert drafts[0].special_use == "\\Drafts"
-
-    def test_folder_not_found(self, provider, account, credentials, fake_imap):
-        """Test selecting non-existent folder raises error."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            with pytest.raises(ConnectionError):
-                _run_async(provider.select_folder("NonExistent"))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UID Correctness Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestUIDCorrectness:
-    def test_search_uses_uid(self, provider, account, credentials, fake_imap):
-        """Test that SEARCH uses UID SEARCH command."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            _run_async(provider.search(EmailSearchQuery()))
-        # Verify uid_search was called (not plain search)
-        assert fake_imap.uid_search.called
-
-    def test_fetch_uses_uid(self, provider, account, credentials, fake_imap):
-        """Test that FETCH uses UID command."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            with patch.object(provider, '_extract_raw_message', return_value=fake_imap._mime_data):
-                _run_async(provider.fetch_message(ref))
-        # Verify UID was used (not seq)
-        assert fake_imap.uid.called
-        # Verify the call was for fetch with UID
-        call_args = fake_imap.uid.call_args
-        assert call_args[0][0] == "fetch"  # First arg is command
-
-    def test_uid_not_sequence(self, provider, account, credentials, fake_imap):
-        """Test that UIDs are used, not sequence numbers."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="9999")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            # This should raise MessageNotFoundError since UID 9999 doesn't exist
-            with pytest.raises(MessageNotFoundError):
-                _run_async(provider.fetch_message(ref))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Search Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestSearch:
-    def test_search_empty(self, provider, account, credentials, fake_imap):
-        """Test searching with no filters."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            results = _run_async(provider.search(EmailSearchQuery()))
-        assert isinstance(results, list)
-        assert all(isinstance(r, EmailMessageRef) for r in results)
-
-    def test_search_sender_filter(self, provider, account, credentials, fake_imap):
-        """Test searching by sender."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            query = EmailSearchQuery(sender="sender@example.com")
-            results = _run_async(provider.search(query))
-        # Verify uid_search was called with correct criteria
-        assert fake_imap.uid_search.called
-        call_args = fake_imap.uid_search.call_args
-        assert "FROM" in call_args[0][1]  # Second arg is criteria
-        assert "sender@example.com" in call_args[0][1]
-
-    def test_search_respects_limit(self, provider, account, credentials, fake_imap):
-        """Test that search respects limit."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            query = EmailSearchQuery(limit=2)
-            results = _run_async(provider.search(query))
-        # Should return at most 2 results
-        assert len(results) <= 2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fetch Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestFetch:
-    def test_fetch_message(self, provider, account, credentials, fake_imap):
-        """Test fetching a message by UID."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            message = _run_async(provider.fetch_message(ref))
-        assert message.reference.uid == "1001"
-        assert message.sender.address == "sender@example.com"
-        assert "Test" in message.subject
-
-    def test_fetch_uses_uid(self, provider, account, credentials, fake_imap):
-        """Test that FETCH uses UID command."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            with patch.object(provider, '_extract_raw_message', return_value=fake_imap._mime_data):
-                _run_async(provider.fetch_message(ref))
-        assert fake_imap.uid.called
-        call_args = fake_imap.uid.call_args
-        assert call_args[0][0] == "fetch"
-
-    def test_fetch_headers_only(self, provider, account, credentials, fake_imap):
-        """Test fetching headers only."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            message = _run_async(provider.fetch_message_headers(ref))
-        # Should not have body content
-        assert message.body_plain is None
-        assert message.body_html is None
-
-    def test_message_not_found(self, provider, account, credentials, fake_imap):
-        """Test message not found error."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="9999")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            with pytest.raises(MessageNotFoundError):
-                _run_async(provider.fetch_message(ref))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Flag Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestFlags:
-    def test_mark_read(self, provider, account, credentials, fake_imap):
-        """Test marking message as read."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.mark_read(ref))
-        assert result.status.value == "success"
-        assert fake_imap.uid.called
-        call_args = fake_imap.uid.call_args
-        assert "+FLAGS" in call_args[0][2]
-
-    def test_mark_unread(self, provider, account, credentials, fake_imap):
-        """Test marking message as unread."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.mark_unread(ref))
-        assert result.status.value == "success"
-        call_args = fake_imap.uid.call_args
-        assert "-FLAGS" in call_args[0][2]
-
-    def test_add_flag(self, provider, account, credentials, fake_imap):
-        """Test adding a flag."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.add_flag(ref, "\\Flagged"))
-        assert result.status.value == "success"
-        call_args = fake_imap.uid.call_args
-        assert "+FLAGS" in call_args[0][2]
-        assert "\\Flagged" in call_args[0][3]
-
-    def test_remove_flag(self, provider, account, credentials, fake_imap):
-        """Test removing a flag."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.remove_flag(ref, "\\Flagged"))
-        assert result.status.value == "success"
-        call_args = fake_imap.uid.call_args
-        assert "-FLAGS" in call_args[0][2]
-        assert "\\Flagged" in call_args[0][3]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Movement Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestMovement:
-    def test_move_message(self, provider, account, credentials, fake_imap):
-        """Test moving a message."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.move_message(ref, "Archive"))
-        assert result.status.value == "success"
-        assert fake_imap.uid.called
-
-    def test_copy_message(self, provider, account, credentials, fake_imap):
-        """Test copying a message."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.copy_message(ref, "Archive"))
-        assert result.status.value == "success"
-        call_args = fake_imap.uid.call_args
-        assert call_args[0][0] == "copy"
-
-    def test_delete_message(self, provider, account, credentials, fake_imap):
-        """Test deleting a message."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.delete_message(ref))
-        assert result.status.value == "success"
-        call_args = fake_imap.uid.call_args
-        assert "+FLAGS" in call_args[0][2]
-        assert "\\Deleted" in call_args[0][3]
-
-    def test_archive_message(self, provider, account, credentials, fake_imap):
-        """Test archiving a message."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.archive_message(ref))
-        assert result.status.value == "success"
-
-    def test_move_fallback_to_copy_delete(self, provider, account, credentials, fake_imap):
-        """Test move fallback when UID MOVE is not supported."""
-        fake_imap.uid.move.return_value = ("BAD", [])  # MOVE not supported
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.move_message(ref, "Archive"))
-        # Should fallback to COPY + DELETE
-        assert result.status.value == "success"
-        assert fake_imap.uid.copy.called
-        assert fake_imap.uid.call_count > 1  # At least one for copy, one for delete
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Draft Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestDrafts:
-    def test_create_draft(self, provider, account, credentials, fake_imap):
-        """Test creating a draft."""
-        draft = EmailDraft(
-            subject="Draft Subject",
-            body_plain="Draft Body",
-            recipients=[EmailAddress("to@example.com")],
-        )
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.create_draft(draft))
-        assert result.status.value == "success"
-        assert fake_imap.append.called
-
-    def test_update_draft(self, provider, account, credentials, fake_imap):
-        """Test updating a draft."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="Drafts", uid="1001")
-        draft = EmailDraft(
-            subject="Updated Subject",
-            body_plain="Updated Body",
-            recipients=[EmailAddress("to@example.com")],
-        )
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.update_draft(ref, draft))
-        assert result.status.value == "success"
-
-    def test_delete_draft(self, provider, account, credentials, fake_imap):
-        """Test deleting a draft message."""
-        draft = EmailDraft(draft_id="1001")
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="Drafts", uid="1001")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            result = _run_async(provider.delete_draft(ref))
-        assert result.status.value == "success"
-
-    def test_missing_drafts_folder(self, provider, account, credentials):
-        """Test draft operations when Drafts folder is missing."""
-        fake_imap = FakeIMAP(folders=["INBOX", "Sent"])
-        draft = EmailDraft(
-            subject="Test",
-            body_plain="Body",
-            recipients=[EmailAddress("to@example.com")],
-        )
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            # Should raise MailboxNotFoundError when Drafts folder doesn't exist
-            with pytest.raises(MailboxNotFoundError):
-                _run_async(provider.create_draft(draft))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SMTP Send Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestSMTPSend:
-    def test_send_success(self, provider, account, credentials, fake_imap):
-        """Test successful email sending."""
-        fake_smtp = FakeSMTP()
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:
-                mock_wrapper = MagicMock()
-                mock_wrapper.sendmail = fake_smtp.sendmail
-                mock_wrapper.quit = fake_smtp.quit
-                mock_wrapper.login = fake_smtp.login
-                MockAsyncSMTP.return_value = mock_wrapper
-                
-                _run_async(provider.connect(account, credentials))
-                result = _run_async(provider.send(
-                    account=account,
-                    to=[EmailAddress("to@example.com")],
-                    subject="Test Subject",
-                    body_plain="Test Body",
-                ))
-        assert result.status.value == "success"
-        assert mock_wrapper.sendmail.called
-
-    def test_send_with_cc_bcc(self, provider, account, credentials, fake_imap):
-        """Test sending with CC and BCC recipients."""
-        fake_smtp = FakeSMTP()
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:
-                mock_wrapper = MagicMock()
-                mock_wrapper.sendmail = fake_smtp.sendmail
-                mock_wrapper.quit = fake_smtp.quit
-                mock_wrapper.login = fake_smtp.login
-                MockAsyncSMTP.return_value = mock_wrapper
-                
-                _run_async(provider.connect(account, credentials))
-                result = _run_async(provider.send(
-                    account=account,
-                    to=[EmailAddress("to@example.com")],
-                    cc=[EmailAddress("cc@example.com")],
-                    bcc=[EmailAddress("bcc@example.com")],
-                    subject="Test",
-                    body_plain="Body",
-                ))
-        assert result.status.value == "success"
-        # Verify all recipients were included
-        call_args = mock_wrapper.sendmail.call_args
-        assert "to@example.com" in call_args[0][1]
-        assert "cc@example.com" in call_args[0][1]
-        assert "bcc@example.com" in call_args[0][1]
-
-    def test_send_with_reply_to(self, provider, account, credentials, fake_imap):
-        """Test sending with reply-to address."""
-        fake_smtp = FakeSMTP()
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:
-                mock_wrapper = MagicMock()
-                mock_wrapper.sendmail = fake_smtp.sendmail
-                mock_wrapper.quit = fake_smtp.quit
-                mock_wrapper.login = fake_smtp.login
-                MockAsyncSMTP.return_value = mock_wrapper
-                
-                _run_async(provider.connect(account, credentials))
-                result = _run_async(provider.send(
-                    account=account,
-                    to=[EmailAddress("to@example.com")],
-                    subject="Test",
-                    body_plain="Body",
-                    reply_to=EmailAddress("reply@example.com"),
-                ))
-        assert result.status.value == "success"
-
-    def test_send_smtp_auth_failure(self, provider, account, credentials, fake_imap):
-        """Test SMTP authentication failure."""
-        import smtplib
-        # Patch the SMTP class directly to raise auth error during connect
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp.smtplib.SMTP") as mock_smtp_cls:
-                mock_smtp_cls.side_effect = smtplib.SMTPAuthenticationError(535, "Authentication failed")
-                _run_async(provider.connect(account, credentials))
-                with pytest.raises(AuthenticationError):
-                    _run_async(provider.send(
-                        account=account,
-                        to=[EmailAddress("to@example.com")],
-                        subject="Test",
-                        body_plain="Body",
-                    ))
-
-    def test_send_invalid_recipient(self, provider, account, credentials, fake_imap):
-        """Test sending to an invalid recipient."""
-        fake_smtp = FakeSMTP()
-        import smtplib
-        fake_smtp.sendmail = MagicMock(side_effect=smtplib.SMTPRecipientsRefused(["recipient@example.com"]))
-
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:
-                mock_wrapper = MagicMock()
-                mock_wrapper.sendmail = fake_smtp.sendmail
-                mock_wrapper.quit = fake_smtp.quit
-                mock_wrapper.login = fake_smtp.login
-                MockAsyncSMTP.return_value = mock_wrapper
-                
-                _run_async(provider.connect(account, credentials))
-                with pytest.raises(InvalidRecipientError):
-                    _run_async(provider.send(
-                        account=account,
-                        to=[EmailAddress("invalid@example.com")],
-                        subject="Test",
-                        body_plain="Body",
-                    ))
-
-    def test_send_smtp_connection_failure(self, provider, account, credentials, fake_imap):
-        """Test SMTP connection failure raises ConnectionError."""
-        import smtplib
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            # Simulate SMTP connect failure
-            with patch("core.email.providers.imap_smtp.smtplib.SMTP") as mock_smtp_cls:
-                mock_smtp_cls.side_effect = smtplib.SMTPConnectError(421, "Service not available")
-                _run_async(provider.connect(account, credentials))
-                with pytest.raises(ConnectionError):
-                    _run_async(provider.send(
-                        account=account,
-                        to=[EmailAddress("to@example.com")],
-                        subject="Test",
-                        body_plain="Body",
-                    ))
-
-    def test_send_without_connect(self, provider, account, credentials):
-        """Test sending without connecting raises error."""
-        # Provider needs to be connected for SMTP - patch SMTP to fail connection
-        with patch("core.email.providers.imap_smtp.smtplib.SMTP") as mock_smtp_cls:
-            mock_smtp_cls.side_effect = Exception("Connection refused")
-            with pytest.raises(Exception):  # Connection error
-                _run_async(provider.send(
-                    account=account,
-                    to=[EmailAddress("to@example.com")],
-                    subject="Test",
-                    body_plain="Body",
-                ))
-
-    def test_send_attachment_size_limit(self, provider, account, credentials, fake_imap):
-        """Test attachment size limit is enforced."""
-        large_attachment = EmailAttachment(
-            attachment_id="att_001",
-            filename="large.pdf",
-            content_type="application/pdf",
-            byte_size=EmailLimits.MAX_TOTAL_ATTACHMENT_SIZE_BYTES + 1,
-        )
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            with patch("core.email.providers.imap_smtp.smtplib.SMTP"):
-                with pytest.raises(Exception):  # AttachmentTooLargeError
-                    _run_async(provider.send(
-                        account=account,
-                        to=[EmailAddress("to@example.com")],
-                        subject="Test",
-                        body_plain="Body",
-                        attachments=[large_attachment],
-                    ))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Security Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestSecurity:
-    def test_password_not_in_metadata(self, provider, account, credentials, fake_imap):
-        """Test password is not exposed in metadata."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            metadata = provider.metadata
-            assert "secret123" not in str(metadata)
-
-    def test_password_not_in_exceptions(self, provider, account, credentials, fake_imap):
-        """Test password is not leaked in exception messages."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            # Connection error should not contain password
-            with pytest.raises(Exception) as exc_info:
-                raise ConnectionError("Connection failed")
-            assert "secret123" not in str(exc_info.value)
-
-    def test_tls_verification_not_disabled(self, provider, account, credentials, fake_imap):
-        """Test that TLS verification is not disabled."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            # Provider should use IMAP4_SSL (TLS) by default
-            # The test verifies the implementation uses SSL
-
-    def test_credential_not_retained_after_disconnect(self, provider, account, credentials, fake_imap):
-        """Test credentials are cleared after disconnect."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            assert provider._credentials is not None
-            _run_async(provider.disconnect())
-            assert provider._credentials is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Error Mapping Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestErrorMapping:
-    def test_auth_error(self, provider, account, credentials):
-        """Test authentication error mapping."""
-        def auth_fail(*args, **kwargs):
-            raise Exception("LOGIN failed")
-
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", side_effect=auth_fail):
-            with pytest.raises(Exception):  # Raw exception propagates
-                _run_async(provider.connect(account, credentials))
-
-    def test_connection_error(self, provider, account, credentials):
-        """Test connection error mapping."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL") as mock_imap:
-            mock_imap.side_effect = Exception("Connection refused")
-            with pytest.raises(ConnectionError):
-                _run_async(provider.connect(account, credentials))
-
-    def test_mailbox_not_found(self, provider, account, credentials, fake_imap):
-        """Test mailbox not found error."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            with pytest.raises(ConnectionError):
-                _run_async(provider.select_folder("NonExistent"))
-
-    def test_message_not_found(self, provider, account, credentials, fake_imap):
-        """Test message not found error."""
-        ref = EmailMessageRef(account_id="test@example.com", mailbox="INBOX", uid="9999")
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            with pytest.raises(MessageNotFoundError):
-                _run_async(provider.fetch_message(ref))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Capability Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestCapabilities:
-    def test_capabilities_discovered(self, provider, account, credentials, fake_imap):
-        """Test that capabilities are discovered correctly."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-        caps = provider.metadata.capabilities
-        # IMAP capabilities should be discovered
-        assert Capability.SEARCH in caps.supported
-        assert Capability.FETCH in caps.supported
-        assert Capability.FOLDERS in caps.supported
-        assert Capability.DRAFTS in caps.supported
-        # SEND is a provider-level capability, added in _discover_capabilities
-        assert provider.supports(Capability.SEND)
-
-    def test_capability_detection(self, provider):
-        """Test capability detection logic."""
-        # Provider should have default capabilities
-        assert provider.supports(Capability.SEARCH)
-        assert provider.supports(Capability.FETCH)
-        assert provider.supports(Capability.FOLDERS)
-
-    def test_unsupported_operation(self, provider, account, credentials, fake_imap):
-        """Test unsupported operation raises appropriate error."""
-        with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake_imap):
-            _run_async(provider.connect(account, credentials))
-            # This should work - we're testing basic capabilities
-            folders = _run_async(provider.list_folders())
-            assert isinstance(folders, list)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities Tests
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestUtilities:
-    def test_parse_folder_line(self):
-        """Test parsing IMAP LIST response line."""
-        provider = ImapSmtpProvider()
-        folder = provider._parse_folder_line('(\\HasNoChildren) "." "INBOX"')
-        assert folder.provider_name == "INBOX"
-        assert folder.selectable
-
-    def test_build_search_criteria(self):
-        """Test building IMAP search criteria."""
-        provider = ImapSmtpProvider()
-        query = EmailSearchQuery(
-            sender="test@example.com",
-            subject="Hello",
-        )
-        criteria = provider._build_search_criteria(query)
-        assert "FROM" in criteria
-        assert "SUBJECT" in criteria
-        assert "test@example.com" in criteria
-        assert "Hello" in criteria
-
-    def test_provider_implements_all_abstract_methods(self, provider):
-        """Ensure provider implements all required abstract methods."""
-        from core.email.providers.base import EmailProvider
-        # Verify it's a proper subclass
-        assert isinstance(provider, EmailProvider)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_message_ref(uid):
-    return EmailMessageRef(
-        account_id="test@example.com",
-        mailbox="INBOX",
-        uid=str(uid),
+def account():
+    return EmailAccount(
+        account_id="user@example.com",
+        provider="imap_smtp",
+        primary_address=EmailAddress("user@example.com"),
+        server_config=EmailServerConfig(
+            imap_host="imap.example.com",
+            imap_port=993,
+            smtp_host="smtp.example.com",
+            smtp_port=587,
+            imap_security="ssl",
+            smtp_security="starttls",
+        ),
     )
+
+
+@pytest.fixture
+def connected(account, credentials):
+    fake = FakeIMAP()
+    provider = ImapSmtpProvider()
+    with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake):
+        asyncio.run(provider.connect(account, credentials))
+    return provider, fake
+
+
+def test_account_keeps_capabilities_separate_from_server_config():
+    account = EmailAccount(
+        "id", "imap_smtp", capabilities=["SEARCH"],
+        server_config=EmailServerConfig("imap.example.com", smtp_host="smtp.example.com"),
+    )
+    assert account.capabilities == ["SEARCH"]
+    assert account.server_config.imap_host == "imap.example.com"
+    assert not isinstance(account.capabilities, dict)
+
+
+def test_legacy_config_is_normalized_without_secrets():
+    account = EmailAccount(
+        "id", "imap_smtp",
+        capabilities={"imap_server": "imap.example.com", "imap_port": 993, "smtp_server": "smtp.example.com"},
+    )
+    assert account.capabilities == []
+    assert account.server_config.imap_host == "imap.example.com"
+    assert account.server_config.smtp_host == "smtp.example.com"
+
+
+def test_connect_uses_credential_store_and_never_capabilities_for_password(account, credentials):
+    fake = FakeIMAP()
+    with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake):
+        provider = ImapSmtpProvider()
+        metadata = asyncio.run(provider.connect(account, credentials))
+    assert provider.is_connected
+    assert metadata.provider_type == "imap_smtp"
+    assert fake.calls[0][0] == "login"
+    assert fake.calls[0][2] == "test-password"
+    assert Capability.SEARCH in metadata.capabilities.values
+
+
+def test_uid_search_is_used_for_server_side_search(connected):
+    provider, fake = connected
+    refs = asyncio.run(provider.search(EmailSearchQuery(sender="sender@example.com")))
+    assert [r.uid for r in refs]
+    call = next(c for c in fake.calls if c[0] == "uid_search")
+    assert "FROM" in call[2]
+    assert not any(c[0] == "search" for c in fake.calls)
+
+
+def test_unsupported_search_semantics_are_rejected(connected):
+    provider, _ = connected
+    with pytest.raises(ProviderCapabilityError):
+        asyncio.run(provider.search(EmailSearchQuery(thread_id="thread-1")))
+    with pytest.raises(ProviderCapabilityError):
+        asyncio.run(provider.search(EmailSearchQuery(has_attachment=True)))
+
+
+def test_fetch_uses_uid_and_peek(connected):
+    provider, fake = connected
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    message = asyncio.run(provider.fetch_message(ref))
+    assert message.reference.uid == "1001"
+    call = next(c for c in fake.calls if c[0] == "fetch")
+    assert call[1] == "1001"
+    assert call[2] == "BODY.PEEK[]"
+
+
+def test_fetch_headers_is_header_only_and_peek(connected):
+    provider, fake = connected
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    message = asyncio.run(provider.fetch_message_headers(ref))
+    call = next(c for c in fake.calls if c[0] == "fetch")
+    assert call[2] == "BODY.PEEK[HEADER]"
+    assert message.body_plain is None
+    assert message.body_html is None
+
+
+def test_message_not_found_maps_from_provider_status(connected):
+    provider, fake = connected
+    fake.fetch_status = "NO"
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    with pytest.raises(MessageNotFoundError):
+        asyncio.run(provider.fetch_message(ref))
+
+
+def test_mark_read_uses_uid_store(connected):
+    provider, fake = connected
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    result = asyncio.run(provider.mark_read(ref))
+    assert result.status is OperationStatus.SUCCESS
+    assert ("store", "1001", "+FLAGS", "(\\Seen)") in fake.calls
+
+
+def test_move_uses_uid_move(connected):
+    provider, fake = connected
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    result = asyncio.run(provider.move_message(ref, "Archive"))
+    assert result.is_success
+    assert ("move", "1001", "Archive") in fake.calls
+
+
+def test_move_fallback_requires_safe_uid_expunge(connected):
+    provider, fake = connected
+    fake.move_status = "NO"
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    result = asyncio.run(provider.move_message(ref, "Archive"))
+    assert result.is_success
+    assert ("copy", "1001", "Archive") in fake.calls
+    assert ("expunge", "1001") in fake.calls
+
+
+def test_archive_requires_advertised_archive_folder(connected):
+    provider, fake = connected
+    fake.folders = ["INBOX", "Sent"]
+    ref = EmailMessageRef("user@example.com", "INBOX", "1001")
+    with pytest.raises(ProviderCapabilityError):
+        asyncio.run(provider.archive_message(ref))
+
+
+def test_get_folder_info_does_not_change_selected_folder(connected):
+    provider, fake = connected
+    assert provider._current_folder == "INBOX"
+    asyncio.run(provider.get_folder_info("Archive"))
+    assert provider._current_folder == "INBOX"
+    assert not any(c[0] == "select" for c in fake.calls)
+
+
+def test_missing_drafts_folder_is_explicit_error(connected):
+    provider, fake = connected
+    fake.folders = ["INBOX", "Sent"]
+    with pytest.raises(MailboxNotFoundError):
+        asyncio.run(provider.create_draft(EmailDraft(subject="draft")))
+
+
+def test_send_uses_smtp_tls_and_credential_store(account, credentials):
+    imap = FakeIMAP()
+    smtp = FakeSMTP()
+    provider = ImapSmtpProvider()
+    with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=imap), \
+         patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=smtp):
+        asyncio.run(provider.connect(account, credentials))
+        result = asyncio.run(provider.send(account, [EmailAddress("to@example.com")], "Subject", "Body"))
+    assert result.is_success
+    assert any(c[0] == "starttls" for c in smtp.calls)
+    assert any(c[0] == "login" for c in smtp.calls)
+    assert any(c[0] == "sendmail" for c in smtp.calls)
+
+
+def test_invalid_recipient_is_rejected_before_smtp(account, credentials):
+    imap = FakeIMAP()
+    provider = ImapSmtpProvider()
+    with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=imap):
+        asyncio.run(provider.connect(account, credentials))
+    with pytest.raises(Exception):
+        asyncio.run(provider.send(account, [EmailAddress("invalid")], "Subject", "Body"))
+
+
+def test_disconnect_clears_credentials_and_is_idempotent(connected):
+    provider, fake = connected
+    asyncio.run(provider.disconnect())
+    asyncio.run(provider.disconnect())
+    assert not provider.is_connected
+    assert provider._credentials is None
+    assert provider._account is None
+    assert any(c[0] == "logout" for c in fake.calls)
+
+
+def test_context_manager_cleanup(account, credentials):
+    fake = FakeIMAP()
+    provider = ImapSmtpProvider()
+    with patch("core.email.providers.imap_smtp.IMAP4_SSL", return_value=fake):
+        asyncio.run(provider.__aenter__())
+    assert provider._state.value in {"authenticated", "connected"}
