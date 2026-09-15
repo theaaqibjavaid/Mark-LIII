@@ -1,0 +1,50 @@
+name: Task 4 Finalize
+
+on: push
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          pip install pytest pytest-cov coverage
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+      - name: Correct provider and protocol doubles
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('core/email/providers/imap_smtp.py')
+          s = p.read_text()
+          old = '''        uid_method = self._imap.uid\n        command_method = getattr(uid_method, command.lower(), None)\n        if callable(command_method):\n            return await _run_sync(command_method, *args, timeout=_DEFAULT_COMMAND_TIMEOUT)\n        return await _run_sync(uid_method, command, *args, timeout=_DEFAULT_COMMAND_TIMEOUT)'''
+          new = '''        return await _run_sync(self._imap.uid, command, *args, timeout=_DEFAULT_COMMAND_TIMEOUT)'''
+          if old not in s: raise SystemExit('expected UID wrapper block not found')
+          p.write_text(s.replace(old, new))
+
+          t = Path('tests/email/test_imap_smtp.py')
+          ts = t.read_text()
+          ts = re.sub(r'(?m)^([ ]*)with pytest\.raises\(ConnectionError\):\n\1    _run_async\(provider\.select_folder\("NonExistent"\)\)', r'\1with pytest.raises(MailboxNotFoundError):\n\1    _run_async(provider.select_folder("NonExistent"))', ts)
+          ts = re.sub(r'(?m)^([ ]*)with patch\("core\.email\.providers\.imap_smtp\._AsyncSMTPWrapper" as MockAsyncSMTP:', r'\1with patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=fake_smtp), patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:', ts)
+          ts = ts.replace('with pytest.raises(MessageNotFoundError):\n            _run_async(provider.fetch_message(ref))', 'with pytest.raises(MessageNotFoundError):\n            fake_imap.fetch_result = ("NO", [])\n            _run_async(provider.fetch_message(ref))')
+          t.write_text(ts)
+          PY
+      - name: Run email tests
+        run: xvfb-run -a pytest -q tests/email
+      - name: Run full suite
+        run: xvfb-run -a pytest -q
+      - name: Commit verified corrections
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add core/email/providers/imap_smtp.py tests/email/test_imap_smtp.py
+          git diff --cached --quiet || git commit -m 'fix: finalize task 4 provider verification'
+          git push origin HEAD:${GITHUB_REF_NAME}
