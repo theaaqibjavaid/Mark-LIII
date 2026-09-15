@@ -1,13 +1,13 @@
 # 18 — Implementation Phases
 
 ## Phase A — Foundation
-- [ ] Create package structure.
-- [ ] Define models.
-- [ ] Define typed errors.
-- [ ] Define limits.
-- [ ] Define credential-store interface.
-- [ ] Define policy.
-- [ ] Add unit tests.
+- [x] Create package structure.
+- [x] Define models.
+- [x] Define typed errors.
+- [x] Define limits.
+- [x] Define credential-store interface.
+- [x] Define policy.
+- [x] Add unit tests.
 
 ## Phase B — Provider boundary
 - [ ] Define provider protocol.
