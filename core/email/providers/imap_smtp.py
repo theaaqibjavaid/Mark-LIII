@@ -339,6 +339,11 @@ class ImapSmtpProvider(EmailProvider):
         self._require_connected(); self._require_capability(Capability.SEND)
         recipients = list(to) + list(cc or []) + list(bcc or [])
         if not recipients or any("@" not in r.address for r in recipients): raise InvalidRecipientError("Invalid or missing recipient")
+        try:
+            EmailLimits.validate_recipient_count(len(recipients))
+        except ValueError as exc:
+            raise InvalidRecipientError("Recipient count exceeds limit") from exc
+        EmailLimits.validate_subject_length(len(subject))
         if len(attachments or []) > EmailLimits.MAX_ATTACHMENTS_PER_MESSAGE: raise AttachmentTooLargeError("Attachment count exceeds limit")
         if any(a.byte_size > EmailLimits.MAX_ATTACHMENT_SIZE_BYTES for a in attachments or []): raise AttachmentTooLargeError("Attachment exceeds size limit")
         if sum(a.byte_size for a in attachments or []) > EmailLimits.MAX_TOTAL_ATTACHMENT_SIZE_BYTES: raise AttachmentTooLargeError("Total attachment size exceeds limit")
