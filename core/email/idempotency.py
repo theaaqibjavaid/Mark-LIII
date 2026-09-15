@@ -19,6 +19,7 @@ class IdempotencyStore(Protocol):
     def begin(self, operation_id: str, fingerprint: str) -> IdempotencyRecord: ...
     def get(self, operation_id: str) -> Optional[IdempotencyRecord]: ...
     def complete(self, operation_id: str, result: Any) -> IdempotencyRecord: ...
+    def mark_unknown(self, operation_id: str, result: Any) -> IdempotencyRecord: ...
 
 
 class InMemoryIdempotencyStore:
@@ -47,13 +48,19 @@ class InMemoryIdempotencyStore:
         with self._lock:
             return self._records.get(operation_id)
 
-    def complete(self, operation_id: str, result: Any) -> IdempotencyRecord:
+    def _finish(self, operation_id: str, result: Any, status: str) -> IdempotencyRecord:
         with self._lock:
             existing = self._records.get(operation_id)
             if existing is None:
                 raise KeyError(operation_id)
             if existing.status != "pending":
                 raise ValueError("operation is already complete")
-            updated = IdempotencyRecord(operation_id, existing.fingerprint, "success", result)
+            updated = IdempotencyRecord(operation_id, existing.fingerprint, status, result)
             self._records[operation_id] = updated
             return updated
+
+    def complete(self, operation_id: str, result: Any) -> IdempotencyRecord:
+        return self._finish(operation_id, result, "success")
+
+    def mark_unknown(self, operation_id: str, result: Any) -> IdempotencyRecord:
+        return self._finish(operation_id, result, "unknown")
