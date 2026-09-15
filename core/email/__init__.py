@@ -12,6 +12,8 @@ from .models import (
     EmailSearchQuery, EmailOperationResult, OperationStatus,
 )
 from .policy import EmailPolicy, OperationCategory, policy
+from .mime import OutboundAttachment, build_outbound_message
+from .parser import parse_message
 
 __all__ = [
     "EmailAccount", "EmailAddress", "EmailServerConfig", "EmailMessageRef",
@@ -22,4 +24,5 @@ __all__ = [
     "AttachmentTooLargeError", "InvalidRecipientError", "TLSConfigurationError",
     "ProviderCapabilityError", "TransientProviderError", "PermanentProviderError",
     "EmailLimits", "EmailPolicy", "OperationCategory", "policy",
+    "OutboundAttachment", "build_outbound_message", "parse_message",
 ]
