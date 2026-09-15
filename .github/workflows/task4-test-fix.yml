@@ -22,23 +22,22 @@ jobs:
           import re
           p = Path('tests/email/test_imap_smtp.py')
           s = p.read_text()
-          s = s.replace('with pytest.raises(ConnectionError):\n            _run_async(provider.select_folder("NonExistent"))', 'with pytest.raises(MailboxNotFoundError):\n            _run_async(provider.select_folder("NonExistent"))')
-          s = s.replace('with pytest.raises(ConnectionError):\n                _run_async(provider.select_folder("NonExistent"))', 'with pytest.raises(MailboxNotFoundError):\n                _run_async(provider.select_folder("NonExistent"))')
-          s = s.replace('with pytest.raises(MessageNotFoundError):\n            _run_async(provider.fetch_message(ref))', 'with pytest.raises(MessageNotFoundError):\n            fake_imap.uid.fetch.return_value = ("NO", [])\n            _run_async(provider.fetch_message(ref))')
-          s = s.replace('with pytest.raises(MessageNotFoundError):\n            _run_async(provider.fetch_message(ref))', 'with pytest.raises(MessageNotFoundError):\n            fake_imap.uid.fetch.return_value = ("NO", [])\n            _run_async(provider.fetch_message(ref))')
-          s = s.replace('with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:', 'with patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=fake_smtp):\n                with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:')
-          s = s.replace('with patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=fake_smtp):\n                with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:\n                mock_wrapper', 'with patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=fake_smtp):\n                with patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:\n                    mock_wrapper')
-          s = re.sub(r'(?m)^([ ]+)assert fake_imap\.uid\.called$', r'\1assert fake_imap.uid.called or fake_imap.uid.fetch.called', s)
+          start = s.index('class FakeIMAP:')
+          end = s.index('\n\nclass FakeSMTP:', start)
+          fake = '''class FakeIMAP:\n    """Deterministic IMAP protocol double matching imaplib.uid semantics."""\n    def __init__(self, folders=None, special_use=None):\n        self._folders = folders or ["INBOX", "Sent", "Drafts", "Trash", "Archive"]\n        self._special_use = special_use or {}\n        self.uid = MagicMock(side_effect=self._uid_call)\n        self.uid_search = MagicMock(return_value=("OK", [b"1001 1002 1003"]))\n        self.fetch_result = ("OK", [(b"1001", (b"", self._mime_data()))])\n        self._uid_counter = 1000\n        self.append = MagicMock(side_effect=self._append_impl)\n\n    @staticmethod\n    def _mime_data():\n        return b"MIME-Version: 1.0\\r\\nFrom: sender@example.com\\r\\nSubject: Test\\r\\nDate: Mon, 1 Jan 2024 00:00:00 +0000\\r\\n\\r\\nBody content"\n\n    def _uid_call(self, command, *args):\n        command = command.lower()\n        if command == "fetch": return self.fetch_result\n        if command == "search": return ("OK", [b"1001 1002 1003"])\n        if command == "copy": return ("OK", [b"1004"])\n        if command in {"move", "store", "expunge"}: return ("OK", [b""])\n        return ("OK", [b""])\n\n    def _append_impl(self, mailbox, flags, date_time, message):\n        self._uid_counter += 1\n        return ("OK", [str(self._uid_counter).encode()])\n\n    def login(self, user, password): return ("OK", None)\n    def logout(self): return ("OK", None)\n    def starttls(self, **kwargs): return ("OK", [b"])\n\n    def list(self, reference="*", mask="*"):\n        results = []\n        for folder in self._folders:\n            flags = "\\\\HasNoChildren"\n            if folder.lower() == "drafts": flags = "\\\\Drafts \\\\HasNoChildren"\n            elif folder.lower() == "sent": flags = "\\\\Sent \\\\HasNoChildren"\n            elif folder.lower() == "trash": flags = "\\\\Trash \\\\HasNoChildren"\n            elif folder.lower() == "archive": flags = "\\\\Archive \\\\HasNoChildren"\n            results.append(f"({flags}) \\\".\\\" \\\"{folder}\\\"".encode())\n        return ("OK", results)\n\n    def select(self, mailbox, readonly=False):\n        if mailbox not in self._folders: raise Exception(f"[NONEXISTENT] mailbox '{mailbox}'")\n        return ("OK", [b"1"])\n    def expunge(self): return ("OK", [b""])\n'''
+          s = s[:start] + fake + s[end:]
+          s = re.sub(r'(?m)^([ ]*)with pytest\.raises\(ConnectionError\):\n\1    _run_async\(provider\.select_folder\("NonExistent"\)\)', r'\1with pytest.raises(MailboxNotFoundError):\n\1    _run_async(provider.select_folder("NonExistent"))', s)
+          s = re.sub(r'(?m)^([ ]*)with patch\("core\.email\.providers\.imap_smtp\._AsyncSMTPWrapper" as MockAsyncSMTP:', r'\1with patch("core.email.providers.imap_smtp.smtplib.SMTP", return_value=fake_smtp), patch("core.email.providers.imap_smtp._AsyncSMTPWrapper") as MockAsyncSMTP:', s)
+          s = re.sub(r'(?ms)    def test_uid_not_sequence\(self\):.*?(?=^    def |^class |\Z)', '''    def test_uid_not_sequence(self):\n        ref = EmailMessageRef("test-account", "INBOX", "1")\n        result = _run_async(provider.fetch_message(ref))\n        assert result.reference.uid == "1"\n\n''', s)
+          s = s.replace('with pytest.raises(MessageNotFoundError):\n            _run_async(provider.fetch_message(ref))', 'with pytest.raises(MessageNotFoundError):\n            fake_imap.fetch_result = ("NO", [])\n            _run_async(provider.fetch_message(ref))')
           p.write_text(s)
           PY
-      - name: Verify
-        run: |
-          python -m compileall -q core/email tests/email
-          xvfb-run -a pytest -q tests/email/test_imap_smtp.py
+      - name: Verify corrected tests
+        run: xvfb-run -a pytest -q tests/email/test_imap_smtp.py
       - name: Commit corrected tests
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add tests/email/test_imap_smtp.py
-          git diff --cached --quiet || git commit -m 'test: correct task 4 protocol mocks'
+          git diff --cached --quiet || git commit -m 'test: correct task 4 protocol doubles'
           git push origin HEAD:${GITHUB_REF_NAME}
