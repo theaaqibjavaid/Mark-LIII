@@ -42,9 +42,18 @@ class TestEmailAddress:
         addr = EmailAddress("user@example.com", "John Doe")
         assert addr.name == "John Doe"
 
-    def test_normalizes_case(self):
+    def test_normalizes_domain_case(self):
         addr = EmailAddress("User@Example.COM")
-        assert addr.address == "user@example.com"
+        # Local part preserved, domain lowercased
+        assert addr.address == "User@example.com"
+
+    def test_preserves_local_part_casing(self):
+        addr = EmailAddress("John.Doe@Example.COM")
+        assert addr.address == "John.Doe@example.com"
+
+    def test_mixed_case_local_part(self):
+        addr = EmailAddress("First.Last@Domain.COM")
+        assert addr.address == "First.Last@domain.com"
 
     def test_trims_whitespace(self):
         addr = EmailAddress("  user@example.com  ")
@@ -303,14 +312,33 @@ class TestEmailDraft:
 class TestEmailSearchQuery:
     def test_defaults(self):
         query = EmailSearchQuery()
-        assert query.limit == 50
+        assert query.limit is None
         assert query.offset == 0
         assert query.sort_by == "date"
         assert query.sort_order == "desc"
 
+    def test_resolved_limit_with_none(self):
+        from core.email.limits import EmailLimits
+        query = EmailSearchQuery()
+        assert query.resolved_limit == EmailLimits.DEFAULT_READ_LIMIT
+
+    def test_resolved_limit_with_value(self):
+        from core.email.limits import EmailLimits
+        query = EmailSearchQuery(limit=20)
+        assert query.resolved_limit == 20
+
+    def test_resolved_limit_clamped(self):
+        from core.email.limits import EmailLimits
+        query = EmailSearchQuery(limit=1000)
+        assert query.resolved_limit == EmailLimits.MAX_SEARCH_RESULTS
+
     def test_negative_limit_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):
             EmailSearchQuery(limit=-1)
+
+    def test_zero_limit_rejected(self):
+        with pytest.raises(ValueError, match="positive"):
+            EmailSearchQuery(limit=0)
 
     def test_negative_offset_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):

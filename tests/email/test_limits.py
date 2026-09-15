@@ -53,7 +53,7 @@ class TestDefaultValues:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Validation
+# Validation — Attachment Size
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -79,6 +79,11 @@ class TestValidateAttachmentSize:
         assert result == EmailLimits.MAX_ATTACHMENT_SIZE_BYTES
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Recipient Count
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 class TestValidateRecipientCount:
     def test_valid_count(self):
         result = EmailLimits.validate_recipient_count(5)
@@ -101,14 +106,20 @@ class TestValidateRecipientCount:
         assert result == 100
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Search Limit
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 class TestValidateSearchLimit:
     def test_valid_limit(self):
         result = EmailLimits.validate_search_limit(10)
         assert result == 10
 
-    def test_zero_allowed(self):
-        result = EmailLimits.validate_search_limit(0)
-        assert result == 0
+    def test_zero_rejected(self):
+        """Zero is invalid for search limits."""
+        with pytest.raises(ValueError, match="positive"):
+            EmailLimits.validate_search_limit(0)
 
     def test_negative_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):
@@ -119,14 +130,20 @@ class TestValidateSearchLimit:
         assert result == EmailLimits.MAX_SEARCH_RESULTS
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Read Limit
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 class TestValidateReadLimit:
     def test_valid_limit(self):
         result = EmailLimits.validate_read_limit(5)
         assert result == 5
 
-    def test_zero_returns_default(self):
-        result = EmailLimits.validate_read_limit(0)
-        assert result == EmailLimits.DEFAULT_READ_LIMIT
+    def test_zero_rejected(self):
+        """Zero is invalid for read limits."""
+        with pytest.raises(ValueError, match="positive"):
+            EmailLimits.validate_read_limit(0)
 
     def test_negative_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):
@@ -142,7 +159,161 @@ class TestValidateReadLimit:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Centralized configuration
+# Validation — Attachment Count
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidateAttachmentCount:
+    def test_valid_count(self):
+        result = EmailLimits.validate_attachment_count(3)
+        assert result == 3
+
+    def test_zero_rejected(self):
+        with pytest.raises(ValueError, match="positive"):
+            EmailLimits.validate_attachment_count(0)
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            EmailLimits.validate_attachment_count(-1)
+
+    def test_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_attachment_count(11)
+
+    def test_exact_max_allowed(self):
+        result = EmailLimits.validate_attachment_count(10)
+        assert result == 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Total Attachment Size
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidateTotalAttachmentSize:
+    def test_valid_size(self):
+        result = EmailLimits.validate_total_attachment_size(1024)
+        assert result == 1024
+
+    def test_zero_allowed(self):
+        result = EmailLimits.validate_total_attachment_size(0)
+        assert result == 0
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            EmailLimits.validate_total_attachment_size(-1)
+
+    def test_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_total_attachment_size(EmailLimits.MAX_TOTAL_ATTACHMENT_SIZE_BYTES + 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Message Size
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidateMessageSize:
+    def test_valid_size(self):
+        result = EmailLimits.validate_message_size(1024)
+        assert result == 1024
+
+    def test_zero_allowed(self):
+        result = EmailLimits.validate_message_size(0)
+        assert result == 0
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            EmailLimits.validate_message_size(-1)
+
+    def test_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_message_size(EmailLimits.MAX_MESSAGE_SIZE_BYTES + 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Mailbox Page Size
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidateMailboxPageSize:
+    def test_valid_size(self):
+        result = EmailLimits.validate_mailbox_page_size(50)
+        assert result == 50
+
+    def test_zero_rejected(self):
+        with pytest.raises(ValueError, match="positive"):
+            EmailLimits.validate_mailbox_page_size(0)
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            EmailLimits.validate_mailbox_page_size(-1)
+
+    def test_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_mailbox_page_size(101)
+
+    def test_exact_max_allowed(self):
+        result = EmailLimits.validate_mailbox_page_size(100)
+        assert result == 100
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Body Length
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidateBodyLength:
+    def test_preview_mode(self):
+        result = EmailLimits.validate_body_length(100)
+        assert result == 100
+
+    def test_full_mode(self):
+        result = EmailLimits.validate_body_length(1000, full=True)
+        assert result == 1000
+
+    def test_preview_max_allowed(self):
+        result = EmailLimits.validate_body_length(EmailLimits.MAX_BODY_PREVIEW_LENGTH)
+        assert result == EmailLimits.MAX_BODY_PREVIEW_LENGTH
+
+    def test_preview_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_body_length(EmailLimits.MAX_BODY_PREVIEW_LENGTH + 1)
+
+    def test_full_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_body_length(EmailLimits.MAX_BODY_FULL_LENGTH + 1, full=True)
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            EmailLimits.validate_body_length(-1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation — Subject Length
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidateSubjectLength:
+    def test_valid_length(self):
+        result = EmailLimits.validate_subject_length(50)
+        assert result == 50
+
+    def test_max_allowed(self):
+        result = EmailLimits.validate_subject_length(EmailLimits.MAX_SUBJECT_LENGTH)
+        assert result == EmailLimits.MAX_SUBJECT_LENGTH
+
+    def test_over_max_rejected(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            EmailLimits.validate_subject_length(EmailLimits.MAX_SUBJECT_LENGTH + 1)
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            EmailLimits.validate_subject_length(-1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Centralized Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
 

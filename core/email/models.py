@@ -10,12 +10,28 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from .limits import EmailLimits
+
 
 class EmailAddress:
-    """Normalized email address with optional display name."""
+    """Normalized email address with optional display name.
+
+    Normalization rules (provider-neutral):
+    - Surrounding whitespace is stripped
+    - Domain portion is lowercased (domains are case-insensitive per RFC 4343)
+    - Local part casing is preserved (case-sensitive per RFC 5321 in many contexts)
+    """
 
     def __init__(self, address: str, name: str = "") -> None:
-        self.address = address.strip().lower()
+        address = address.strip()
+        # Split into local and domain parts
+        if "@" in address:
+            local, domain = address.rsplit("@", 1)
+            # Preserve local part casing, lowercase domain
+            self.address = f"{local}@{domain.lower()}"
+        else:
+            # No @ symbol — treat as-is but still strip
+            self.address = address.lower()
         self.name = name.strip() if name else ""
 
     def __repr__(self) -> str:
@@ -180,16 +196,25 @@ class EmailSearchQuery:
     flags: Optional[list[str]] = None
     thread_id: Optional[str] = None
     has_attachment: Optional[bool] = None
-    limit: int = 50
+    limit: Optional[int] = None  # None = use default, 0 = invalid
     offset: int = 0
     sort_by: str = "date"  # "date", "relevance"
     sort_order: str = "desc"  # "asc", "desc"
 
     def __post_init__(self) -> None:
-        if self.limit < 0:
+        if self.limit is not None and self.limit < 0:
             raise ValueError("limit must be non-negative")
+        if self.limit == 0:
+            raise ValueError("limit must be positive (use None for default)")
         if self.offset < 0:
             raise ValueError("offset must be non-negative")
+
+    @property
+    def resolved_limit(self) -> int:
+        """Return the effective limit after applying defaults and caps."""
+        if self.limit is None:
+            return EmailLimits.DEFAULT_READ_LIMIT
+        return min(self.limit, EmailLimits.MAX_SEARCH_RESULTS)
 
 
 @dataclass
