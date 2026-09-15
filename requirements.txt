@@ -36,8 +36,7 @@ qrcode[pil]
 
 # ── Email Engine: secure OS credential storage + OAuth ────────────────────────
 keyring
-# Gmail OAuth/API
- google-api-python-client
+google-api-python-client
 google-auth-oauthlib
 
 # ── Plugin extras: Tuya / Smart Life smart light (home_assistant) ─────────────
