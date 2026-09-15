@@ -26,9 +26,7 @@ class OutboundAttachment:
 def _safe_filename(filename: str) -> str:
     name = filename.replace("\\", "/").split("/")[-1].strip()
     name = re.sub(r"[\x00-\x1f\x7f]", "_", name)
-    if name in {"", ".", ".."}:
-        return "attachment"
-    return name
+    return name if name not in {"", ".", ".."} else "attachment"
 
 
 def _validate_address(address: EmailAddress) -> None:
@@ -48,8 +46,22 @@ def _set_date(msg: EmailMessage, date: datetime | str | None) -> None:
         msg["Date"] = format_datetime(datetime.now(timezone.utc))
 
 
+def _attach(
+    parent: EmailMessage, attachment: OutboundAttachment, *, disposition: str
+) -> None:
+    maintype, subtype = (
+        attachment.content_type.split("/", 1)
+        if "/" in attachment.content_type
+        else ("application", "octet-stream")
+    )
+    kwargs = {"filename": _safe_filename(attachment.filename), "disposition": disposition}
+    if attachment.content_id:
+        kwargs["cid"] = attachment.content_id.strip("<>")
+    parent.add_attachment(attachment.content, maintype=maintype, subtype=subtype, **kwargs)
+
+
 def _build_body(
-    body_plain: Optional[str], body_html: Optional[str], *, inline: list[OutboundAttachment]
+    body_plain: Optional[str], body_html: Optional[str], inline: list[OutboundAttachment]
 ) -> EmailMessage:
     body = EmailMessage(policy=SMTP)
     if body_plain is not None and body_html is not None:
@@ -63,11 +75,7 @@ def _build_body(
     if inline:
         body.make_related()
         for attachment in inline:
-            maintype, subtype = attachment.content_type.split("/", 1) if "/" in attachment.content_type else ("application", "octet-stream")
-            kwargs = {"filename": _safe_filename(attachment.filename), "disposition": "inline"}
-            if attachment.content_id:
-                kwargs["cid"] = attachment.content_id.strip("<>")
-            body.add_attachment(attachment.content, maintype=maintype, subtype=subtype, **kwargs)
+            _attach(body, attachment, disposition="inline")
     return body
 
 
@@ -92,9 +100,7 @@ def build_outbound_message(
         raise ValueError("At least one email body (plain or html) is required")
     EmailLimits.validate_subject_length(len(subject))
 
-    to = list(recipients)
-    cc_list = list(cc or [])
-    bcc_list = list(bcc or [])
+    to, cc_list, bcc_list = list(recipients), list(cc or []), list(bcc or [])
     all_recipients = to + cc_list + bcc_list
     if not all_recipients:
         raise ValueError("At least one recipient is required")
@@ -119,9 +125,19 @@ def build_outbound_message(
 
     inline = [a for a in parts if a.disposition.lower() == "inline"]
     regular = [a for a in parts if a.disposition.lower() != "inline"]
-    body = _build_body(body_plain, body_html, inline=inline)
+    body = _build_body(body_plain, body_html, inline)
 
-    msg = EmailMessage(policy=SMTP)
+    # The complete MIME body is built first; message headers are then applied
+    # to the actual root so nested multipart semantics remain standards-safe.
+    if regular:
+        msg = EmailMessage(policy=SMTP)
+        msg.make_mixed()
+        msg.attach(body)
+        for attachment in regular:
+            _attach(msg, attachment, disposition="attachment")
+    else:
+        msg = body
+
     msg["From"] = sender.format()
     msg["To"] = ", ".join(a.format() for a in to)
     if cc_list:
@@ -137,38 +153,6 @@ def build_outbound_message(
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = " ".join(references)
-
-    # Transfer the prepared body tree into the root. make_* preserves the
-    # body structure and lets the stdlib choose correct MIME boundaries.
-    msg.set_payload(body)
-    if body.is_multipart():
-        msg.set_type(body.get_content_type())
-        msg.set_boundary(body.get_boundary())
-        msg.set_payload(body.get_payload())
-        for key in ("Content-Type", "Content-Transfer-Encoding", "MIME-Version"):
-            if key in body and key != "Content-Type":
-                msg[key] = body[key]
-        if body.get_content_type() == "multipart/related":
-            msg.set_payload(body.get_payload())
-            msg["MIME-Version"] = "1.0"
-    else:
-        msg.set_content(body.get_content(), subtype=body.get_content_subtype(), charset="utf-8")
-
-    if regular:
-        # Rebuild the root as multipart/mixed around the complete body tree.
-        headers = [(k, msg[k]) for k in ("From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID", "Reply-To", "In-Reply-To", "References") if msg.get(k) is not None]
-        mixed = EmailMessage(policy=SMTP)
-        for key, value in headers:
-            mixed[key] = value
-        mixed.make_mixed()
-        mixed.attach(body)
-        for attachment in regular:
-            maintype, subtype = attachment.content_type.split("/", 1) if "/" in attachment.content_type else ("application", "octet-stream")
-            kwargs = {"filename": _safe_filename(attachment.filename), "disposition": "attachment"}
-            if attachment.content_id:
-                kwargs["cid"] = attachment.content_id.strip("<>")
-            mixed.add_attachment(attachment.content, maintype=maintype, subtype=subtype, **kwargs)
-        msg = mixed
 
     raw = msg.as_bytes(policy=SMTP)
     EmailLimits.validate_message_size(len(raw))
