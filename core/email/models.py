@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from email.utils import parseaddr
 from .limits import EmailLimits
 
 @dataclass
@@ -20,16 +21,22 @@ class EmailServerConfig:
 class EmailAddress:
     def __init__(self, address: str, name: str = ""):
         if not isinstance(address, str): raise TypeError("address must be a string")
-        address = address.strip()
-        if any(ch in address for ch in "\r\n") or not address or "@" not in address:
+        raw = address.strip()
+        if any(ch in raw for ch in "\r\n") or not raw:
             raise ValueError("Invalid email address")
-        local, domain = address.rsplit("@", 1)
-        if not local or not domain or "." not in domain or any(ch.isspace() for ch in address):
+        parsed_name, parsed_address = parseaddr(raw)
+        if not parsed_address or "@" not in parsed_address:
             raise ValueError("Invalid email address")
-        self.address = local + "@" + domain.lower()
-        self.name = name.strip() if name else ""
-        if any(ch in self.name for ch in "\r\n"):
+        if parsed_address != raw and not ("<" in raw and ">" in raw):
+            raise ValueError("Invalid email address")
+        local, domain = parsed_address.rsplit("@", 1)
+        if not local or not domain or "." not in domain or any(ch.isspace() for ch in parsed_address):
+            raise ValueError("Invalid email address")
+        display_name = name.strip() if name else parsed_name.strip()
+        if any(ch in display_name for ch in "\r\n"):
             raise ValueError("Invalid email display name")
+        self.address = local + "@" + domain.lower()
+        self.name = display_name
     def __repr__(self): return f"EmailAddress({self.address!r})"
     def __eq__(self, other): return isinstance(other, EmailAddress) and self.address == other.address
     def __hash__(self): return hash(self.address)
