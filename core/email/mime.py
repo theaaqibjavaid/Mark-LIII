@@ -12,7 +12,6 @@ from typing import Iterable, Optional
 from .limits import EmailLimits
 from .models import EmailAddress
 
-
 @dataclass(frozen=True)
 class OutboundAttachment:
     filename: str
@@ -22,12 +21,10 @@ class OutboundAttachment:
     content_id: Optional[str] = None
     declared_size: Optional[int] = None
 
-
 def _safe_filename(filename: str) -> str:
     name = filename.replace("\\", "/").split("/")[-1].strip()
     name = re.sub(r"[\x00-\x1f\x7f]", "_", name)
     return name if name not in {"", ".", ".."} else "attachment"
-
 
 def _validate_address(address: EmailAddress) -> None:
     if not address.address or "@" not in address.address:
@@ -35,7 +32,6 @@ def _validate_address(address: EmailAddress) -> None:
     local, domain = address.address.rsplit("@", 1)
     if not local or not domain or "." not in domain:
         raise ValueError(f"Invalid recipient address: {address.address!r}")
-
 
 def _set_date(msg: EmailMessage, date: datetime | str | None) -> None:
     if isinstance(date, str):
@@ -45,7 +41,6 @@ def _set_date(msg: EmailMessage, date: datetime | str | None) -> None:
     else:
         msg["Date"] = format_datetime(datetime.now(timezone.utc))
 
-
 def _attach_regular(parent: EmailMessage, attachment: OutboundAttachment) -> None:
     maintype, subtype = attachment.content_type.split("/", 1) if "/" in attachment.content_type else ("application", "octet-stream")
     kwargs = {"filename": _safe_filename(attachment.filename), "disposition": "attachment"}
@@ -53,18 +48,14 @@ def _attach_regular(parent: EmailMessage, attachment: OutboundAttachment) -> Non
         kwargs["cid"] = attachment.content_id.strip("<>")
     parent.add_attachment(attachment.content, maintype=maintype, subtype=subtype, **kwargs)
 
-
 def _attach_inline(parent: EmailMessage, attachment: OutboundAttachment) -> None:
     maintype, subtype = attachment.content_type.split("/", 1) if "/" in attachment.content_type else ("application", "octet-stream")
     part = EmailMessage(policy=SMTP)
     part.set_content(attachment.content, maintype=maintype, subtype=subtype)
-    part["Content-Disposition"] = "inline"
-    part["Content-Type"] = attachment.content_type
+    part.replace_header("Content-Disposition", f'inline; filename="{_safe_filename(attachment.filename)}"')
     if attachment.content_id:
         part["Content-ID"] = f"<{attachment.content_id.strip('<>')}>"
-    part["Content-Disposition"] = f'inline; filename="{_safe_filename(attachment.filename)}"'
     parent.attach(part)
-
 
 def _build_body(body_plain: Optional[str], body_html: Optional[str], inline: list[OutboundAttachment]) -> EmailMessage:
     body = EmailMessage(policy=SMTP)
@@ -81,23 +72,7 @@ def _build_body(body_plain: Optional[str], body_html: Optional[str], inline: lis
             _attach_inline(body, attachment)
     return body
 
-
-def build_outbound_message(
-    *,
-    sender: EmailAddress,
-    recipients: Iterable[EmailAddress],
-    subject: str,
-    body_plain: Optional[str] = None,
-    body_html: Optional[str] = None,
-    attachments: Optional[Iterable[OutboundAttachment]] = None,
-    cc: Optional[Iterable[EmailAddress]] = None,
-    bcc: Optional[Iterable[EmailAddress]] = None,
-    reply_to: Optional[EmailAddress] = None,
-    in_reply_to: Optional[str] = None,
-    references: Optional[Iterable[str]] = None,
-    date: Optional[datetime | str] = None,
-    message_id: Optional[str] = None,
-) -> bytes:
+def build_outbound_message(*, sender: EmailAddress, recipients: Iterable[EmailAddress], subject: str, body_plain: Optional[str] = None, body_html: Optional[str] = None, attachments: Optional[Iterable[OutboundAttachment]] = None, cc: Optional[Iterable[EmailAddress]] = None, bcc: Optional[Iterable[EmailAddress]] = None, reply_to: Optional[EmailAddress] = None, in_reply_to: Optional[str] = None, references: Optional[Iterable[str]] = None, date: Optional[datetime | str] = None, message_id: Optional[str] = None) -> bytes:
     """Build an RFC-compatible message and return serialized bytes."""
     if body_plain is None and body_html is None:
         raise ValueError("At least one email body (plain or html) is required")
@@ -112,7 +87,6 @@ def build_outbound_message(
         _validate_address(address)
     if reply_to:
         _validate_address(reply_to)
-
     parts = list(attachments or [])
     if len(parts) > EmailLimits.MAX_ATTACHMENTS_PER_MESSAGE:
         raise ValueError("Attachment count exceeds configured limit")
@@ -124,7 +98,6 @@ def build_outbound_message(
         EmailLimits.validate_attachment_size(size)
         total += size
     EmailLimits.validate_total_attachment_size(total)
-
     inline = [a for a in parts if a.disposition.lower() == "inline"]
     regular = [a for a in parts if a.disposition.lower() != "inline"]
     body = _build_body(body_plain, body_html, inline)
@@ -136,7 +109,6 @@ def build_outbound_message(
             _attach_regular(msg, attachment)
     else:
         msg = body
-
     msg["From"] = sender.format()
     msg["To"] = ", ".join(a.format() for a in to)
     if cc_list:
@@ -152,7 +124,6 @@ def build_outbound_message(
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = " ".join(references)
-
     raw = msg.as_bytes(policy=SMTP)
     EmailLimits.validate_message_size(len(raw))
     return raw
