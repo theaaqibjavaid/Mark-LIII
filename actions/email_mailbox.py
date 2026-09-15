@@ -19,10 +19,23 @@ def _handler(parameters=None, **_):
         op = nonempty(p["operation"], "operation").lower(); account_id = nonempty(p["account_id"], "account_id"); svc = service()
         if op == "list_folders": return ok(run(svc.list_folders(account_id)))
         ref = _ref(account_id, p.get("mailbox"), p.get("uid"))
-        if op == "mark_read": return ok(run(svc.mark_read(account_id, ref)))
-        if op == "mark_unread": return ok(run(svc.mark_unread(account_id, ref)))
-        if op == "flag": return ok(run(svc.add_flag(account_id, ref, nonempty(p.get("flag"), "flag"))))
-        if op == "unflag": return ok(run(svc.remove_flag(account_id, ref, nonempty(p.get("flag"), "flag"))))
+        if op in {"mark_read", "mark_unread"}:
+            before = run(svc.get_message(account_id, ref, include_body=False, include_attachments=False))
+            result = run(svc.mark_read(account_id, ref) if op == "mark_read" else svc.mark_unread(account_id, ref))
+            previous = bool(getattr(before, "is_read", False))
+            if result.is_success and previous != (op == "mark_read"):
+                inverse = svc.mark_read if previous else svc.mark_unread
+                undo_stack.push_undo(f"Restore read state for email {ref.uid}", lambda: run(inverse(account_id, ref)))
+            return ok(result)
+        if op in {"flag", "unflag"}:
+            flag = nonempty(p.get("flag"), "flag")
+            before = run(svc.get_message(account_id, ref, include_body=False, include_attachments=False))
+            previous = flag in getattr(before, "flags", [])
+            result = run(svc.add_flag(account_id, ref, flag) if op == "flag" else svc.remove_flag(account_id, ref, flag))
+            if result.is_success and previous != (op == "flag"):
+                inverse = svc.add_flag if previous else svc.remove_flag
+                undo_stack.push_undo(f"Restore flag {flag} on email {ref.uid}", lambda: run(inverse(account_id, ref, flag)))
+            return ok(result)
         if op == "archive": return ok(run(svc.archive(account_id, ref)))
         if op in {"move", "copy"}:
             target = nonempty(p.get("target_folder"), "target_folder")

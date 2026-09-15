@@ -18,4 +18,11 @@ def _handler(parameters=None, **_):
     except Exception as exc:
         return error(exc)
 
-TOOL = {"name": "email_search", "description": "Search an email account using provider-neutral filters and bounded result limits.", "parameters": {"type": "OBJECT", "properties": {"account_id": {"type": "STRING"}, "sender": {"type": "STRING"}, "recipients": {"type": "ARRAY"}, "subject": {"type": "STRING"}, "body": {"type": "STRING"}, "limit": {"type": "INTEGER"}, "offset": {"type": "INTEGER"}, "sort_by": {"type": "STRING"}, "sort_order": {"type": "STRING"}}, "required": ["account_id"]}, "handler": _handler}
+_PROPERTIES = {
+    "account_id": {"type": "STRING"}, "sender": {"type": "STRING"}, "recipients": {"type": "ARRAY"},
+    "subject": {"type": "STRING"}, "body": {"type": "STRING"}, "date_from": {"type": "STRING"},
+    "date_to": {"type": "STRING"}, "folders": {"type": "ARRAY"}, "flags": {"type": "ARRAY"},
+    "thread_id": {"type": "STRING"}, "has_attachment": {"type": "BOOLEAN"}, "limit": {"type": "INTEGER"},
+    "offset": {"type": "INTEGER"}, "sort_by": {"type": "STRING"}, "sort_order": {"type": "STRING"},
+}
+TOOL = {"name": "email_search", "description": "Search an email account using provider-neutral filters and bounded result limits.", "parameters": {"type": "OBJECT", "properties": _PROPERTIES, "required": ["account_id"]}, "handler": _handler}
