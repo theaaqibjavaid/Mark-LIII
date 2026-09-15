@@ -6,16 +6,42 @@
 
 ## Purpose
 
-This folder is the authoritative implementation plan for replacing the current minimal email capability with a secure, reliable, provider-aware email subsystem. It is deliberately separated from implementation code so every change can be reviewed, tested, and tracked before it touches runtime behavior.
+This directory is the authoritative implementation plan for upgrading Mark-LIII's current minimal email capability into a secure, reliable, provider-aware email control subsystem. Documentation is intentionally isolated from runtime code so the implementation can proceed phase-by-phase with explicit regression gates.
 
 ## Non-negotiable repository invariant
 
 > No existing Mark-LIII behavior may be changed merely because the new email engine is cleaner. Existing contracts must first be identified and protected with tests. Any intentional behavior change requires an explicit migration note, compatibility decision, and regression evidence.
 
+## Document map
+
+| Document | Purpose |
+|---|---|
+| `00-current-state-audit.md` | Existing contracts, weaknesses, compatibility freeze |
+| `01-architecture.md` | Layering, dependencies, integration boundaries |
+| `02-data-model.md` | Provider-neutral typed models |
+| `03-provider-abstraction.md` | Common provider interface and capabilities |
+| `04-imap-smtp.md` | Generic IMAP/SMTP implementation requirements |
+| `05-gmail-provider.md` | Gmail API/OAuth plan |
+| `06-microsoft-provider.md` | Microsoft Graph/OAuth plan |
+| `07-message-mime-parser.md` | MIME construction and parsing |
+| `08-email-actions.md` | Mark-LIII action/tool surface |
+| `09-security.md` | Secrets, transport, filesystem, authorization, untrusted data |
+| `10-confirmation-and-undo.md` | High-risk confirmation and reversible operations |
+| `11-idempotency-and-reliability.md` | Retries, timeouts, ambiguous sends, typed failures |
+| `12-ai-agent-safety.md` | Prompt-injection and untrusted-email controls |
+| `13-attachment-system.md` | Safe attachment upload/download |
+| `14-search-and-threading.md` | Search, pagination, UIDs, threading |
+| `15-account-and-credential-management.md` | Account lifecycle and secret storage |
+| `16-testing-strategy.md` | Unit, integration, security, failure and regression tests |
+| `17-migration-plan.md` | Incremental migration and rollback |
+| `18-implementation-phases.md` | Phase-by-phase execution tracker |
+| `19-regression-protection.md` | Protected surfaces and regression gates |
+| `20-production-readiness-checklist.md` | Final release gate |
+
 ## Master tracker
 
 - [ ] Current architecture audited
-- [ ] Design approved
+- [x] Design approved
 - [ ] Foundation implemented
 - [ ] Provider abstraction implemented
 - [ ] IMAP/SMTP provider implemented
@@ -39,7 +65,7 @@ This folder is the authoritative implementation plan for replacing the current m
 
 ## Target capability surface
 
-The engine should support account configuration, provider capability discovery, mailbox/folder discovery, search, message retrieval, threading, compose, drafts, send, reply, reply-all, forward, attachments, mark read/unread, star/flag, archive, move, copy, delete, and safe error reporting. Actions must return structured data rather than UI-formatted strings.
+The completed engine should support account configuration, provider capability discovery, mailbox/folder discovery, bounded search, message retrieval, threading, compose, drafts, send, reply, reply-all, forward, attachments, mark read/unread, star/flag, archive, move, copy, delete, and safe typed error reporting. Actions should return structured data rather than UI-formatted strings.
 
 ## Target architecture
 
@@ -96,4 +122,7 @@ core/email/service.py
 
 The subsystem is complete only when all capabilities in this tracker have passing tests, existing Mark-LIII tests remain green, secrets are protected, dangerous actions are confirmation-gated, ambiguous sends are recoverable without duplicate delivery, providers expose accurate capabilities, and rollback to the previous email implementation is documented and tested.
 
-See the numbered documents in this directory for the detailed contract and phase requirements.
+## Change log
+
+- Initial architecture/documentation set created on `dev` after design approval.
+- Runtime implementation intentionally not started in this documentation phase.
