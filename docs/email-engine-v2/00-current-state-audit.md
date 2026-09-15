@@ -13,10 +13,10 @@ every observable behavior that must remain unchanged during the V2 migration.
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `actions/email.py` | 527 | Single-module email action with send, read, configure |
-| `tests/test_email.py` | 426 | Unit tests for email module |
-| `tests/test_features.py` | 275 | Feature tests including email |
-| `tests/test_integration.py` | 224 | E2E tests including email |
+| `actions/email.py` | 526 | Single-module email action with send, read, configure |
+| `tests/test_email.py` | 425 | Unit tests for email module |
+| `tests/test_features.py` | 274 | Feature tests including email |
+| `tests/test_integration.py` | 223 | E2E tests including email |
 | `tests/test_implementation.py` | 129 | Action loader / tool declaration tests |
 
 ## Existing email action contract
@@ -165,7 +165,7 @@ All three handlers: `(parameters: dict, player=None, session_memory=None) -> str
 - [x] Existing action schemas captured
 - [x] Existing config contract captured
 - [x] Existing tests identified (test_email.py, test_features.py, test_integration.py, test_implementation.py)
-- [x] Baseline test run recorded (177 passed)
+- [x] Baseline test run recorded (177 original tests passed)
 - [x] Regression tests written (tests/email/test_regression.py)
 - [x] Compatibility decisions documented
 - [x] No production code modified
