@@ -5,6 +5,7 @@ variables are present. Credentials must never be committed to the repository.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -12,8 +13,6 @@ import pytest
 from core.email.credentials import InMemoryCredentialStore
 from core.email.models import EmailAccount, EmailAddress, EmailDraft, EmailSearchQuery, EmailServerConfig
 from core.email.providers.imap_smtp import ImapSmtpProvider
-
-pytestmark = pytest.mark.integration
 
 
 def _required(*names: str) -> dict[str, str]:
@@ -24,68 +23,69 @@ def _required(*names: str) -> dict[str, str]:
     return {name: value for name, value in values.items() if value is not None}
 
 
-@pytest.mark.asyncio
-async def test_imap_smtp_real_mailbox_smoke() -> None:
+def test_imap_smtp_real_mailbox_smoke() -> None:
     values = _required(
         "MARK_EMAIL_SMTP_HOST", "MARK_EMAIL_SMTP_PORT",
         "MARK_EMAIL_IMAP_HOST", "MARK_EMAIL_IMAP_PORT",
         "MARK_EMAIL_USERNAME", "MARK_EMAIL_PASSWORD",
     )
-    account = EmailAccount(
-        account_id="smoke-imap-smtp",
-        provider="imap_smtp",
-        primary_address=EmailAddress(values["MARK_EMAIL_USERNAME"]),
-        server_config=EmailServerConfig(
-            imap_host=values["MARK_EMAIL_IMAP_HOST"],
-            imap_port=int(values["MARK_EMAIL_IMAP_PORT"]),
-            smtp_host=values["MARK_EMAIL_SMTP_HOST"],
-            smtp_port=int(values["MARK_EMAIL_SMTP_PORT"]),
-            imap_security=os.environ.get("MARK_EMAIL_IMAP_SECURITY", "ssl"),
-            smtp_security=os.environ.get("MARK_EMAIL_SMTP_SECURITY", "starttls"),
-        ),
-    )
-    credentials = InMemoryCredentialStore()
-    credentials.set_password("imap_smtp", values["MARK_EMAIL_USERNAME"], values["MARK_EMAIL_PASSWORD"])
-    provider = ImapSmtpProvider()
 
-    try:
-        metadata = await provider.connect(account, credentials, timeout=15)
-        assert provider.is_connected
-        assert metadata.provider_type == "imap_smtp"
-        folders = await provider.list_folders()
-        assert folders, "provider connected but advertised no folders"
-        refs = await provider.search(EmailSearchQuery(limit=5))
-        if refs:
-            message = await provider.fetch_message_headers(refs[0])
-            assert message.reference == refs[0]
+    async def run() -> None:
+        account = EmailAccount(
+            account_id="smoke-imap-smtp",
+            provider="imap_smtp",
+            primary_address=EmailAddress(values["MARK_EMAIL_USERNAME"]),
+            server_config=EmailServerConfig(
+                imap_host=values["MARK_EMAIL_IMAP_HOST"],
+                imap_port=int(values["MARK_EMAIL_IMAP_PORT"]),
+                smtp_host=values["MARK_EMAIL_SMTP_HOST"],
+                smtp_port=int(values["MARK_EMAIL_SMTP_PORT"]),
+                imap_security=os.environ.get("MARK_EMAIL_IMAP_SECURITY", "ssl"),
+                smtp_security=os.environ.get("MARK_EMAIL_SMTP_SECURITY", "starttls"),
+            ),
+        )
+        credentials = InMemoryCredentialStore()
+        credentials.set_password("imap_smtp", values["MARK_EMAIL_USERNAME"], values["MARK_EMAIL_PASSWORD"])
+        provider = ImapSmtpProvider()
+        try:
+            metadata = await provider.connect(account, credentials, timeout=15)
+            assert provider.is_connected
+            assert metadata.provider_type == "imap_smtp"
+            folders = await provider.list_folders()
+            assert folders, "provider connected but advertised no folders"
+            refs = await provider.search(EmailSearchQuery(limit=5))
+            if refs:
+                message = await provider.fetch_message_headers(refs[0])
+                assert message.reference == refs[0]
 
-        if os.environ.get("MARK_EMAIL_RUN_DRAFT_SMOKE") == "1":
-            draft = EmailDraft(
-                recipients=[EmailAddress(values["MARK_EMAIL_USERNAME"])],
-                subject="Mark-LIII Email Engine V2 smoke test",
-                body_plain="Temporary smoke-test draft; safe to delete.",
-            )
-            result = await provider.create_draft(draft)
-            assert result.is_success
-            if result.affected_refs:
-                await provider.delete_draft(result.affected_refs[0])
+            if os.environ.get("MARK_EMAIL_RUN_DRAFT_SMOKE") == "1":
+                draft = EmailDraft(
+                    recipients=[EmailAddress(values["MARK_EMAIL_USERNAME"])],
+                    subject="Mark-LIII Email Engine V2 smoke test",
+                    body_plain="Temporary smoke-test draft; safe to delete.",
+                )
+                result = await provider.create_draft(draft)
+                assert result.is_success
+                if result.affected_refs:
+                    await provider.delete_draft(result.affected_refs[0])
 
-        if os.environ.get("MARK_EMAIL_RUN_SEND_SMOKE") == "1":
-            recipient = os.environ.get("MARK_EMAIL_SMOKE_RECIPIENT")
-            if not recipient:
-                pytest.fail("MARK_EMAIL_SMOKE_RECIPIENT is required when send smoke is enabled")
-            result = await provider.send(
-                account, [EmailAddress(recipient)],
-                "Mark-LIII Email Engine V2 smoke test",
-                body_plain="Controlled integration smoke test.",
-            )
-            assert result.is_success
-    finally:
-        await provider.disconnect()
+            if os.environ.get("MARK_EMAIL_RUN_SEND_SMOKE") == "1":
+                recipient = os.environ.get("MARK_EMAIL_SMOKE_RECIPIENT")
+                if not recipient:
+                    pytest.fail("MARK_EMAIL_SMOKE_RECIPIENT is required when send smoke is enabled")
+                result = await provider.send(
+                    account, [EmailAddress(recipient)],
+                    "Mark-LIII Email Engine V2 smoke test",
+                    body_plain="Controlled integration smoke test.",
+                )
+                assert result.is_success
+        finally:
+            await provider.disconnect()
+
+    asyncio.run(run())
 
 
-@pytest.mark.asyncio
-async def test_imap_smtp_smoke_is_credential_free_by_default() -> None:
+def test_imap_smtp_smoke_is_credential_free_by_default() -> None:
     if any(os.environ.get(name) for name in ("MARK_EMAIL_USERNAME", "MARK_EMAIL_PASSWORD")):
         pytest.skip("credential-free guard is only meaningful without credentials")
     provider = ImapSmtpProvider()
