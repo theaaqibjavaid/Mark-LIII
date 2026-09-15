@@ -60,10 +60,53 @@
 ## Task 10 rollout gate
 The migration boundary is implemented but production activation is deliberately conservative. Legacy remains the default; staged mode sends low-risk operations to V2 only when a V2 handler is actually available, and high-impact operations require explicit enablement. No legacy implementation is deleted in this phase.
 
+## Task 11 — Real-provider integration & smoke testing
+
+- [x] Add credential-free, opt-in smoke-test harness.
+- [x] Document external credential/environment contract.
+- [x] Define dedicated-account safety rules and non-secret evidence requirements.
+- [ ] Execute credentialed IMAP/SMTP smoke flow against a dedicated test mailbox.
+- [ ] Execute credentialed Gmail adapter smoke flow against a dedicated test account.
+- [ ] Execute credentialed Microsoft adapter smoke flow against a dedicated test account.
+- [ ] Record non-secret evidence for each provider execution.
+- [ ] Resolve any provider-specific failures before Task 11 acceptance.
+
+Task 11 is not considered real-provider validated when tests merely skip because credentials are absent. CI validates the harness and regression suite; provider acceptance requires credentialed execution and evidence.
+
+## Task 12 — Migration rehearsal & rollback
+
+- [ ] Run legacy characterization tests beside equivalent V2 scenarios.
+- [ ] Document intentional behavior differences.
+- [ ] Exercise legacy → staged → legacy routing.
+- [ ] Prove credentials, drafts, and unrelated state survive rollback.
+- [ ] Prove high-impact operations remain gated during staged rollout.
+- [ ] Record rollback evidence.
+
+## Task 13 — Controlled staged production activation
+
+- [ ] Enable low-risk V2 operations only after Task 11 and Task 12 gates pass.
+- [ ] Monitor authentication, provider, timeout, rate-limit, and action-boundary failures.
+- [ ] Enable send/reply/reply-all/forward/delete only after confirmation verification.
+- [ ] Verify exact recipient/action confirmation details before every high-impact execution.
+- [ ] Keep legacy routing immediately available as rollback target.
+- [ ] Record production-readiness evidence.
+
+## Task 14 — Legacy retirement
+
+- [ ] Establish sustained successful V2 operation before retirement.
+- [ ] Remove runtime dependency on the legacy email implementation.
+- [ ] Preserve intentional compatibility aliases where required.
+- [ ] Remove obsolete plaintext credential/configuration paths.
+- [ ] Delete legacy `actions/email.py` only after the compatibility and rollback gates pass.
+- [ ] Run the full regression/security suite after retirement.
+- [ ] Obtain final production-readiness approval.
+
 ## Evidence
 - Regression/security/failure coverage: `tests/email/`.
 - Migration routing: `tests/email/test_migration.py`, `tests/email/test_migration_router.py`.
-- CI run `34986047578`: Python 3.12 and 3.13 successful for the migration documentation checkpoint.
+- Real-provider runbook: `docs/email-engine-v2/21-real-provider-smoke-tests.md`.
+- Task 11 harness: `tests/email/test_provider_smoke.py`.
+- CI evidence must reference completed GitHub Actions runs; skipped credentialed smoke tests are not provider acceptance evidence.
 
 ## Gate rule
-A phase cannot be marked production-complete until its tests and acceptance criteria pass and no unresolved regression exists from the previous phase. The remaining real-provider smoke and formal approval items intentionally keep Phase H open.
+A phase cannot be marked production-complete until its tests and acceptance criteria pass and no unresolved regression exists from the previous phase. The remaining credentialed provider smoke, migration rehearsal, staged activation, and formal approval items intentionally keep Phase H open.
