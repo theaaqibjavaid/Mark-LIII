@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -22,12 +23,7 @@ def configure(service: Any) -> None:
 
 
 def _bootstrap_default_service() -> Any:
-    """Lazily bridge the persisted legacy account into Email Engine V2.
-
-    The legacy UI/configuration path predates V2. This bridge keeps startup
-    independent of email availability while allowing V2 actions to use a
-    configured account when they are actually invoked.
-    """
+    """Lazily bridge the persisted legacy account into Email Engine V2."""
     global _SERVICE, _BOOTSTRAP_ATTEMPTED
     if _SERVICE is not None:
         return _SERVICE
@@ -112,10 +108,19 @@ def error(exc: Exception, *, default_code: str = "email_error") -> str:
     return json.dumps({"ok": False, "error": {"code": code, "message": message}}, ensure_ascii=False, separators=(",", ":"))
 
 
+def _run_in_thread(coro: Any) -> Any:
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="email-v2") as executor:
+        return executor.submit(asyncio.run, coro).result()
+
+
 def run(coro: Any) -> Any:
-    if inspect.iscoroutine(coro):
+    if not inspect.iscoroutine(coro):
+        return coro
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
         return asyncio.run(coro)
-    return coro
+    return _run_in_thread(coro)
 
 
 def safe_call(fn: Callable[[], Any]) -> str:
