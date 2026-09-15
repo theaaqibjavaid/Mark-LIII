@@ -6,21 +6,47 @@ import inspect
 import json
 from dataclasses import asdict, is_dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable
 
 from core.email.errors import EmailError, ProviderCapabilityError
 
 _SERVICE: Any = None
+_BOOTSTRAP_ATTEMPTED = False
 
 
 def configure(service: Any) -> None:
-    global _SERVICE
+    global _SERVICE, _BOOTSTRAP_ATTEMPTED
     _SERVICE = service
+    _BOOTSTRAP_ATTEMPTED = True
+
+
+def _bootstrap_default_service() -> Any:
+    """Lazily bridge the persisted legacy account into Email Engine V2.
+
+    The legacy UI/configuration path predates V2. This bridge keeps startup
+    independent of email availability while allowing V2 actions to use a
+    configured account when they are actually invoked.
+    """
+    global _SERVICE, _BOOTSTRAP_ATTEMPTED
+    if _SERVICE is not None:
+        return _SERVICE
+    if _BOOTSTRAP_ATTEMPTED:
+        raise RuntimeError("Email service is not configured")
+    _BOOTSTRAP_ATTEMPTED = True
+    try:
+        from core.email.runtime import build_legacy_imap_service
+        base_dir = Path(__file__).resolve().parent.parent
+        _SERVICE = build_legacy_imap_service(base_dir / "config" / "api_keys.json")
+        return _SERVICE
+    except Exception as exc:
+        _SERVICE = None
+        raise RuntimeError(f"Email service is not configured: {exc}") from exc
 
 
 def service() -> Any:
     if _SERVICE is None:
-        raise RuntimeError("Email service is not configured")
+        return _bootstrap_default_service()
     return _SERVICE
 
 
@@ -82,8 +108,6 @@ def error(exc: Exception, *, default_code: str = "email_error") -> str:
     elif isinstance(exc, (ValueError, TypeError)): code = "invalid_input"
     elif isinstance(exc, EmailError): code = "email_error"
     else: code = default_code
-    # Never surface raw provider/credential exception text. EmailError messages
-    # are trusted only for their safe, provider-neutral class contract.
     message = str(exc) if isinstance(exc, (EmailError, ValueError, TypeError, PermissionError, KeyError)) else "Email operation failed"
     return json.dumps({"ok": False, "error": {"code": code, "message": message}}, ensure_ascii=False, separators=(",", ":"))
 
