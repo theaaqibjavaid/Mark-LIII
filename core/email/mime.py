@@ -46,23 +46,27 @@ def _set_date(msg: EmailMessage, date: datetime | str | None) -> None:
         msg["Date"] = format_datetime(datetime.now(timezone.utc))
 
 
-def _attach(
-    parent: EmailMessage, attachment: OutboundAttachment, *, disposition: str
-) -> None:
-    maintype, subtype = (
-        attachment.content_type.split("/", 1)
-        if "/" in attachment.content_type
-        else ("application", "octet-stream")
-    )
-    kwargs = {"filename": _safe_filename(attachment.filename), "disposition": disposition}
+def _attach_regular(parent: EmailMessage, attachment: OutboundAttachment) -> None:
+    maintype, subtype = attachment.content_type.split("/", 1) if "/" in attachment.content_type else ("application", "octet-stream")
+    kwargs = {"filename": _safe_filename(attachment.filename), "disposition": "attachment"}
     if attachment.content_id:
         kwargs["cid"] = attachment.content_id.strip("<>")
     parent.add_attachment(attachment.content, maintype=maintype, subtype=subtype, **kwargs)
 
 
-def _build_body(
-    body_plain: Optional[str], body_html: Optional[str], inline: list[OutboundAttachment]
-) -> EmailMessage:
+def _attach_inline(parent: EmailMessage, attachment: OutboundAttachment) -> None:
+    maintype, subtype = attachment.content_type.split("/", 1) if "/" in attachment.content_type else ("application", "octet-stream")
+    part = EmailMessage(policy=SMTP)
+    part.set_content(attachment.content, maintype=maintype, subtype=subtype)
+    part["Content-Disposition"] = "inline"
+    part["Content-Type"] = attachment.content_type
+    if attachment.content_id:
+        part["Content-ID"] = f"<{attachment.content_id.strip('<>')}>"
+    part["Content-Disposition"] = f'inline; filename="{_safe_filename(attachment.filename)}"'
+    parent.attach(part)
+
+
+def _build_body(body_plain: Optional[str], body_html: Optional[str], inline: list[OutboundAttachment]) -> EmailMessage:
     body = EmailMessage(policy=SMTP)
     if body_plain is not None and body_html is not None:
         body.set_content(body_plain)
@@ -71,11 +75,10 @@ def _build_body(
         body.set_content(body_html, subtype="html")
     else:
         body.set_content(body_plain or "")
-
     if inline:
         body.make_related()
         for attachment in inline:
-            _attach(body, attachment, disposition="inline")
+            _attach_inline(body, attachment)
     return body
 
 
@@ -99,7 +102,6 @@ def build_outbound_message(
     if body_plain is None and body_html is None:
         raise ValueError("At least one email body (plain or html) is required")
     EmailLimits.validate_subject_length(len(subject))
-
     to, cc_list, bcc_list = list(recipients), list(cc or []), list(bcc or [])
     all_recipients = to + cc_list + bcc_list
     if not all_recipients:
@@ -126,15 +128,12 @@ def build_outbound_message(
     inline = [a for a in parts if a.disposition.lower() == "inline"]
     regular = [a for a in parts if a.disposition.lower() != "inline"]
     body = _build_body(body_plain, body_html, inline)
-
-    # The complete MIME body is built first; message headers are then applied
-    # to the actual root so nested multipart semantics remain standards-safe.
+    msg = EmailMessage(policy=SMTP)
     if regular:
-        msg = EmailMessage(policy=SMTP)
         msg.make_mixed()
         msg.attach(body)
         for attachment in regular:
-            _attach(msg, attachment, disposition="attachment")
+            _attach_regular(msg, attachment)
     else:
         msg = body
 
