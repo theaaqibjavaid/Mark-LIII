@@ -19,9 +19,17 @@ class EmailServerConfig:
 
 class EmailAddress:
     def __init__(self, address: str, name: str = ""):
+        if not isinstance(address, str): raise TypeError("address must be a string")
         address = address.strip()
-        self.address = (address.rsplit("@",1)[0] + "@" + address.rsplit("@",1)[1].lower()) if "@" in address else address.lower()
+        if any(ch in address for ch in "\r\n") or not address or "@" not in address:
+            raise ValueError("Invalid email address")
+        local, domain = address.rsplit("@", 1)
+        if not local or not domain or "." not in domain or any(ch.isspace() for ch in address):
+            raise ValueError("Invalid email address")
+        self.address = local + "@" + domain.lower()
         self.name = name.strip() if name else ""
+        if any(ch in self.name for ch in "\r\n"):
+            raise ValueError("Invalid email display name")
     def __repr__(self): return f"EmailAddress({self.address!r})"
     def __eq__(self, other): return isinstance(other, EmailAddress) and self.address == other.address
     def __hash__(self): return hash(self.address)
