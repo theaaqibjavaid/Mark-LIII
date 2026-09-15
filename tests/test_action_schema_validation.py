@@ -55,3 +55,12 @@ def test_validate_rejects_nested_array_without_items():
     assert error is not None
     assert "tags" in error
     assert "items" in error
+
+
+def test_task7_email_action_schemas_are_valid():
+    from actions import email_compose, email_mailbox, email_message, email_search
+
+    modules = [email_compose, email_mailbox, email_message, email_search]
+    for module in modules:
+        record = _validate(module, module.__name__.rsplit(".", 1)[-1] + ".py")
+        assert record.valid, f"{module.__name__}: {record.error}"
