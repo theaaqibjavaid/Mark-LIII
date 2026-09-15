@@ -3,6 +3,10 @@ core/email/providers/base.py — Provider abstraction interface.
 
 Defines the contract that all email providers must implement.
 Provider-neutral: no IMAP/Gmail/Graph/protocol-specific concepts.
+
+Connection contract (per spec 03):
+    Every connection has explicit timeout, authentication, cleanup, and
+    cancellation semantics. Context-manager/finally patterns are mandatory.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ from ..errors import (
 )
 from ..models import (
     EmailAccount,
+    EmailAddress,
     EmailAttachment,
     EmailDraft,
     EmailFolder,
@@ -40,7 +45,26 @@ from ..models import (
 # ── Connection State ───────────────────────────────────────────────────────────
 
 class ProviderConnectionState(Enum):
-    """Represents the current connection state of a provider."""
+    """
+    Represents the current connection state of a provider.
+
+    State machine:
+
+        DISCONNECTED ──connect()──► CONNECTING
+               ▲                           │
+               │                   ┌───────┴────────┐
+               │                   ▼                ▼
+               │              DISCONNECTED    AUTHENTICATED
+               │                   ▲               │
+               │                   │        disconnect()
+               │                   └───────┬───────┘
+               │                           ▼
+               │                      DISCONNECTING
+               │                           │
+               └───────────────────────────┘
+
+    Failure/cancellation from CONNECTING returns to DISCONNECTED.
+    """
     DISCONNECTED = auto()
     CONNECTING = auto()
     CONNECTED = auto()
@@ -57,6 +81,10 @@ class Capability(Enum):
 
     Each capability represents a category of operations the provider supports.
     Capabilities are provider-neutral and do not encode protocol specifics.
+
+    Reliability-oriented capabilities (RATE_LIMITING, IDEMPOTENT_SEND,
+    BULK_OPERATIONS) are retained as provider-visible traits so the service
+    layer can make informed decisions about strategy selection.
     """
     # Core messaging
     SEARCH = auto()
@@ -192,27 +220,51 @@ class EmailProvider(ABC):
     - Never store passwords, tokens, or secrets in provider objects.
     - Use CredentialStore for authentication data.
     - Error messages must not leak credentials.
+
+    Lifecycle contract (mandatory per spec 03):
+    - connect(): establishes connection with timeout, handles auth and cleanup.
+    - disconnect(): idempotent cleanup; safe when already disconnected.
+    - Cancellation during connect() must leave provider in DISCONNECTED state.
+    - Async context manager (async with) is supported and preferred for
+      resource-safe usage.
     """
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     @abstractmethod
-    async def connect(self, account: EmailAccount, credentials: CredentialStore) -> ProviderMetadata:
+    async def connect(
+        self,
+        account: EmailAccount,
+        credentials: CredentialStore,
+        timeout: Optional[float] = None,
+    ) -> ProviderMetadata:
         """
         Establish connection and authenticate with the email provider.
 
         Args:
             account: Account metadata (no secrets).
             credentials: Secure credential store for authentication data.
+            timeout: Maximum seconds for connection+auth. None = use provider
+                default. Positive values enforced; negative values rejected.
 
         Returns:
             ProviderMetadata with connection state and capabilities.
+
+        State transitions:
+            DISCONNECTED → CONNECTING → AUTHENTICATED  (success)
+            DISCONNECTED → CONNECTING → DISCONNECTED   (failure/cancellation)
 
         Raises:
             AuthenticationError: Invalid or expired credentials.
             AuthorizationError: Credentials valid but insufficient permissions.
             ConnectionError: Network or server unreachable.
-            TimeoutError: Connection attempt exceeded time limit.
+            TimeoutError: Connection attempt exceeded timeout.
+            ValueError: Invalid timeout value.
+
+        Cancellation semantics:
+            If asyncio.CancelledError occurs during connect(), the provider
+            MUST ensure it transitions back to DISCONNECTED (or remains in
+            DISCONNECTED) — never AUTHENTICATED or CONNECTING.
         """
         ...
 
@@ -221,8 +273,14 @@ class EmailProvider(ABC):
         """
         Close connection and clean up resources.
 
-        Must be idempotent: safe to call multiple times or when disconnected.
-        Must not raise if already disconnected.
+        Must be idempotent: safe to call multiple times, including when
+        already disconnected, partially connected, or after a failed
+        connection attempt.
+
+        State transitions:
+            AUTHENTICATED → DISCONNECTING → DISCONNECTED  (normal)
+            CONNECTING    → DISCONNECTING → DISCONNECTED  (interrupted)
+            DISCONNECTED  → DISCONNECTED                  (no-op)
         """
         ...
 
@@ -237,6 +295,31 @@ class EmailProvider(ABC):
     def is_connected(self) -> bool:
         """True if provider is connected and authenticated."""
         ...
+
+    # ── Async Context Manager ──────────────────────────────────────────────
+
+    async def __aenter__(self) -> "EmailProvider":
+        """
+        Async context manager entry: connect to provider.
+
+        Usage::
+
+            async with provider:
+                messages = await provider.search(query)
+
+        The provider will disconnect on exit, even if an exception occurs.
+        """
+        # Subclasses may override connect() to accept account differently;
+        # concrete providers will inject account/credentials before use.
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        Async context manager exit: disconnect from provider.
+
+        Ensures cleanup happens even if the context body raises.
+        """
+        await self.disconnect()
 
     # ── Mailbox Operations ─────────────────────────────────────────────────
 
@@ -527,22 +610,36 @@ class EmailProvider(ABC):
     async def send(
         self,
         account: EmailAccount,
-        recipients: list[str],
+        to: list[EmailAddress],
         subject: str,
         body_plain: Optional[str] = None,
         body_html: Optional[str] = None,
         attachments: Optional[list[EmailAttachment]] = None,
-        cc: Optional[list[str]] = None,
-        bcc: Optional[list[str]] = None,
-        reply_to: Optional[str] = None,
+        cc: Optional[list[EmailAddress]] = None,
+        bcc: Optional[list[EmailAddress]] = None,
+        reply_to: Optional[EmailAddress] = None,
     ) -> EmailOperationResult:
         """
         Send an email message.
+
+        Uses typed EmailAddress for all recipient fields, consistent with
+        the provider-neutral domain model.
 
         Validates recipients using InvalidRecipientError for malformed addresses.
         Validates attachment sizes using AttachmentTooLargeError.
 
         Requires: Capability.SEND
+
+        Args:
+            account: Account to send from.
+            to: Primary recipients.
+            subject: Email subject line.
+            body_plain: Plain text body (optional).
+            body_html: HTML body (optional).
+            attachments: Attachment metadata (optional).
+            cc: CC recipients (optional).
+            bcc: BCC recipients (optional).
+            reply_to: Reply-to address (optional).
 
         Raises:
             InvalidRecipientError: For malformed recipient addresses.

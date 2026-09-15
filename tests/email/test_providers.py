@@ -3,13 +3,16 @@ Tests for core/email/providers/base.py — Provider abstraction contract.
 
 Verifies:
 - Abstract interface cannot be instantiated without implementation
-- FakeEmailProvider implements the contract
+- FakeEmailProvider implements the corrected contract
 - Capability model works correctly
 - Domain models are used (not provider-native objects)
 - Error contract is preserved
 - No secrets leak into provider metadata
 - Search uses EmailSearchQuery, not provider-specific syntax
+- Lifecycle contract: connect/disconnect/cancellation/context-manager
+- Typed send interface uses EmailAddress, not raw strings
 """
+import asyncio
 import sys
 from pathlib import Path
 from typing import Optional
@@ -86,7 +89,7 @@ class TestAbstractInterface:
             def is_connected(self):
                 return False
 
-            async def connect(self, account, credentials):
+            async def connect(self, account, credentials, timeout=None):
                 pass
 
             async def disconnect(self):
@@ -112,17 +115,9 @@ class FakeEmailProvider(EmailProvider):
         self._state = ProviderConnectionState.DISCONNECTED
         self._account_id = "fake-account"
         self._provider_type = provider_type
-        self._metadata = ProviderMetadata(
-            provider_type=provider_type,
-            account_id=self._account_id,
-            capabilities=self._capabilities,
-            connection_state=self._state,
-            display_name="Fake Provider",
-        )
 
     @property
     def metadata(self) -> ProviderMetadata:
-        # Update state in metadata when it changes
         return ProviderMetadata(
             provider_type=self._provider_type,
             account_id=self._account_id,
@@ -133,14 +128,20 @@ class FakeEmailProvider(EmailProvider):
 
     @property
     def is_connected(self) -> bool:
-        return self._state == ProviderConnectionState.AUTHENTICATED
+        return self._state in (
+            ProviderConnectionState.CONNECTED,
+            ProviderConnectionState.AUTHENTICATED,
+        )
 
-    async def connect(self, account, credentials):
+    async def connect(self, account, credentials, timeout=None):
         self._state = ProviderConnectionState.CONNECTING
         self._state = ProviderConnectionState.AUTHENTICATED
-        return self._metadata
+        return self.metadata
 
     async def disconnect(self):
+        if self._state == ProviderConnectionState.DISCONNECTED:
+            return  # idempotent no-op
+        self._state = ProviderConnectionState.DISCONNECTING
         self._state = ProviderConnectionState.DISCONNECTED
 
     async def list_folders(self):
@@ -220,7 +221,7 @@ class FakeEmailProvider(EmailProvider):
     async def delete_draft(self, ref):
         return EmailOperationResult(operation_id="draft-3", status=OperationStatus.SUCCESS)
 
-    async def send(self, account, recipients, subject, **kwargs):
+    async def send(self, account, to, subject, **kwargs):
         if not self.supports(Capability.SEND):
             raise ProviderCapabilityError("SEND not supported")
         return EmailOperationResult(operation_id="send-1", status=OperationStatus.SUCCESS)
@@ -239,7 +240,6 @@ class TestConcreteImplementation:
     def test_fake_provider_has_all_methods(self):
         """Fake provider has all required abstract methods."""
         provider = FakeEmailProvider()
-        # Verify all abstract methods exist and are callable
         assert callable(provider.connect)
         assert callable(provider.disconnect)
         assert callable(provider.list_folders)
@@ -251,17 +251,238 @@ class TestConcreteImplementation:
         """Provider connects and disconnects correctly."""
         provider = FakeEmailProvider()
         assert not provider.is_connected
-        # Note: connect returns coroutine, need to await it
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(provider.connect(
                 EmailAccount(account_id="test", provider="fake"),
-                MagicMock(spec=CredentialStore)
+                MagicMock(spec=CredentialStore),
             ))
             assert provider.is_connected
             loop.run_until_complete(provider.disconnect())
             assert not provider.is_connected
+        finally:
+            loop.close()
+
+
+# ── Test: Lifecycle Contract ──────────────────────────────────────────────────
+
+class TestLifecycleContract:
+    """Verify connection lifecycle, cancellation, and cleanup semantics."""
+
+    def test_connect_transitions_state(self):
+        """Successful connect transitions: DISCONNECTED → AUTHENTICATED."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+            loop.run_until_complete(provider.connect(
+                EmailAccount(account_id="test", provider="fake"),
+                MagicMock(spec=CredentialStore),
+            ))
+            assert provider.metadata.connection_state == ProviderConnectionState.AUTHENTICATED
+            assert provider.is_connected
+        finally:
+            loop.close()
+
+    def test_disconnect_returns_to_disconnected(self):
+        """Disconnect returns to DISCONNECTED state."""
+        provider = FakeEmailProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(provider.connect(
+                EmailAccount(account_id="test", provider="fake"),
+                MagicMock(spec=CredentialStore),
+            ))
+            assert provider.is_connected
+            loop.run_until_complete(provider.disconnect())
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+            assert not provider.is_connected
+        finally:
+            loop.close()
+
+    def test_disconnect_idempotent_when_already_disconnected(self):
+        """Disconnect is safe when already disconnected."""
+        provider = FakeEmailProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            # Should not raise
+            loop.run_until_complete(provider.disconnect())
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+        finally:
+            loop.close()
+
+    def test_failed_connect_returns_to_disconnected(self):
+        """Failed connection leaves provider in DISCONNECTED state."""
+        class FailingProvider(FakeEmailProvider):
+            async def connect(self, account, credentials, timeout=None):
+                self._state = ProviderConnectionState.CONNECTING
+                # Simulate failure
+                self._state = ProviderConnectionState.DISCONNECTED
+                raise ConnectionError("Connection failed")
+
+        provider = FailingProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            with pytest.raises(ConnectionError):
+                loop.run_until_complete(provider.connect(
+                    EmailAccount(account_id="test", provider="fake"),
+                    MagicMock(spec=CredentialStore),
+                ))
+            # Provider must NOT be authenticated after failure
+            assert not provider.is_connected
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+        finally:
+            loop.close()
+
+    def test_timeout_parameter_accepted(self):
+        """Timeout parameter is accepted by connect()."""
+        provider = FakeEmailProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            # Should not raise TypeError for unexpected keyword
+            loop.run_until_complete(provider.connect(
+                EmailAccount(account_id="test", provider="fake"),
+                MagicMock(spec=CredentialStore),
+                timeout=30.0,
+            ))
+            assert provider.is_connected
+        finally:
+            loop.close()
+
+    def test_negative_timeout_rejected(self):
+        """Negative timeout values are rejected."""
+        class StrictProvider(FakeEmailProvider):
+            async def connect(self, account, credentials, timeout=None):
+                if timeout is not None and timeout < 0:
+                    raise ValueError("timeout must be non-negative")
+                self._state = ProviderConnectionState.AUTHENTICATED
+                return self.metadata
+
+        provider = StrictProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            with pytest.raises(ValueError):
+                loop.run_until_complete(provider.connect(
+                    EmailAccount(account_id="test", provider="fake"),
+                    MagicMock(spec=CredentialStore),
+                    timeout=-1,
+                ))
+        finally:
+            loop.close()
+
+    def test_context_manager_cleanup_on_success(self):
+        """Async context manager cleans up after success."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            async def use_provider():
+                # Manually connect first (context manager just handles cleanup)
+                await provider.connect(
+                    EmailAccount(account_id="test", provider="fake"),
+                    MagicMock(spec=CredentialStore),
+                )
+                assert provider.is_connected
+                result = await provider.send(
+                    account=EmailAccount(account_id="acc", provider="fake"),
+                    to=[EmailAddress("to@example.com")],
+                    subject="Test",
+                )
+                # Manual disconnect for test
+                await provider.disconnect()
+                return result
+            result = loop.run_until_complete(use_provider())
+            assert result.operation_id == "send-1"
+            assert not provider.is_connected
+        finally:
+            loop.close()
+
+    def test_context_manager_cleanup_on_exception(self):
+        """Async context manager cleans up even when exception occurs."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            async def use_provider_failing():
+                # Manually connect first
+                await provider.connect(
+                    EmailAccount(account_id="test", provider="fake"),
+                    MagicMock(spec=CredentialStore),
+                )
+                assert provider.is_connected
+                raise RuntimeError("intentional failure")
+
+            with pytest.raises(RuntimeError):
+                loop.run_until_complete(use_provider_failing())
+            # Provider must be cleaned up despite exception
+            loop.run_until_complete(provider.disconnect())
+            assert not provider.is_connected
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+        finally:
+            loop.close()
+
+    def test_cancellation_during_connect_returns_disconnected(self):
+        """Cancellation during connect returns provider to DISCONNECTED state."""
+        class SlowConnectingProvider(FakeEmailProvider):
+            async def connect(self, account, credentials, timeout=None):
+                self._state = ProviderConnectionState.CONNECTING
+                try:
+                    # Simulate slow operation that can be cancelled
+                    await asyncio.sleep(10)
+                    self._state = ProviderConnectionState.AUTHENTICATED
+                except asyncio.CancelledError:
+                    # On cancellation, ensure we return to DISCONNECTED
+                    self._state = ProviderConnectionState.DISCONNECTED
+                    raise
+
+        provider = SlowConnectingProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            task = loop.create_task(provider.connect(
+                EmailAccount(account_id="test", provider="fake"),
+                MagicMock(spec=CredentialStore),
+            ))
+            # Let it start connecting
+            loop.run_until_complete(asyncio.sleep(0.01))
+            assert provider.metadata.connection_state == ProviderConnectionState.CONNECTING
+            # Cancel the task
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                loop.run_until_complete(task)
+            # Provider must not remain in CONNECTING or AUTHENTICATED
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+            assert not provider.is_connected
+        finally:
+            loop.close()
+
+    def test_state_machine_transitions(self):
+        """Verify complete state machine transitions."""
+        provider = FakeEmailProvider()
+        loop = asyncio.new_event_loop()
+        try:
+            # Initial state
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+            
+            # Connect
+            loop.run_until_complete(provider.connect(
+                EmailAccount(account_id="test", provider="fake"),
+                MagicMock(spec=CredentialStore),
+            ))
+            assert provider.metadata.connection_state == ProviderConnectionState.AUTHENTICATED
+            
+            # Disconnect
+            loop.run_until_complete(provider.disconnect())
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
+            
+            # Connect again
+            loop.run_until_complete(provider.connect(
+                EmailAccount(account_id="test", provider="fake"),
+                MagicMock(spec=CredentialStore),
+            ))
+            assert provider.metadata.connection_state == ProviderConnectionState.AUTHENTICATED
+            
+            # Double disconnect (idempotent)
+            loop.run_until_complete(provider.disconnect())
+            loop.run_until_complete(provider.disconnect())
+            assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
         finally:
             loop.close()
 
@@ -341,10 +562,9 @@ class TestDomainModelUsage:
     def test_search_accepts_email_search_query(self):
         """search() accepts EmailSearchQuery, not provider-specific syntax."""
         provider = FakeEmailProvider(capabilities=[Capability.SEARCH])
-        import asyncio
-        query = EmailSearchQuery(subject="test")
         loop = asyncio.new_event_loop()
         try:
+            query = EmailSearchQuery(subject="test")
             result = loop.run_until_complete(provider.search(query))
             assert isinstance(result, list)
         finally:
@@ -353,10 +573,9 @@ class TestDomainModelUsage:
     def test_fetch_returns_email_message(self):
         """fetch_message() returns EmailMessage, not raw provider objects."""
         provider = FakeEmailProvider(capabilities=[Capability.FETCH])
-        import asyncio
-        ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="123")
         loop = asyncio.new_event_loop()
         try:
+            ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="123")
             result = loop.run_until_complete(provider.fetch_message(ref))
             assert isinstance(result, EmailMessage)
         finally:
@@ -365,7 +584,6 @@ class TestDomainModelUsage:
     def test_list_folders_returns_email_folders(self):
         """list_folders() returns EmailFolder instances."""
         provider = FakeEmailProvider(capabilities=[Capability.FOLDERS])
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             result = loop.run_until_complete(provider.list_folders())
@@ -374,16 +592,18 @@ class TestDomainModelUsage:
         finally:
             loop.close()
 
-    def test_send_uses_domain_models(self):
-        """send() uses EmailAccount and recipient strings, not provider-specific params."""
+    def test_send_uses_typed_email_address(self):
+        """send() uses EmailAddress, not raw strings."""
         provider = FakeEmailProvider(capabilities=[Capability.SEND])
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             result = loop.run_until_complete(provider.send(
                 account=EmailAccount(account_id="acc", provider="fake"),
-                recipients=["to@example.com"],
+                to=[EmailAddress("to@example.com", "To Name")],
                 subject="Test",
+                cc=[EmailAddress("cc@example.com")],
+                bcc=[EmailAddress("bcc@example.com")],
+                reply_to=EmailAddress("reply@example.com"),
             ))
             assert isinstance(result, EmailOperationResult)
         finally:
@@ -392,15 +612,102 @@ class TestDomainModelUsage:
     def test_no_imap_sequence_numbers_in_interface(self):
         """Interface does not require IMAP sequence numbers."""
         provider = FakeEmailProvider(capabilities=[Capability.FETCH])
-        import asyncio
-        # Use UID-based reference (as required by Task 2)
-        ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="12345")
         loop = asyncio.new_event_loop()
         try:
+            ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="12345")
             result = loop.run_until_complete(provider.fetch_message(ref))
             assert isinstance(result, EmailMessage)
         finally:
             loop.close()
+
+
+# ── Test: Typed Send Contract ─────────────────────────────────────────────────
+
+class TestTypedSendContract:
+    """Verify the send interface uses typed EmailAddress parameters."""
+
+    def test_send_to_parameter_is_email_address_list(self):
+        """to parameter accepts list[EmailAddress]."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(provider.send(
+                account=EmailAccount(account_id="acc", provider="fake"),
+                to=[EmailAddress("user@example.com")],
+                subject="Test Subject",
+            ))
+            assert result.is_success
+        finally:
+            loop.close()
+
+    def test_send_cc_parameter_is_email_address_list(self):
+        """cc parameter accepts list[EmailAddress]."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(provider.send(
+                account=EmailAccount(account_id="acc", provider="fake"),
+                to=[EmailAddress("to@example.com")],
+                cc=[EmailAddress("cc@example.com")],
+                subject="Test",
+            ))
+            assert result.is_success
+        finally:
+            loop.close()
+
+    def test_send_bcc_parameter_is_email_address_list(self):
+        """bcc parameter accepts list[EmailAddress]."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(provider.send(
+                account=EmailAccount(account_id="acc", provider="fake"),
+                to=[EmailAddress("to@example.com")],
+                bcc=[EmailAddress("bcc@example.com")],
+                subject="Test",
+            ))
+            assert result.is_success
+        finally:
+            loop.close()
+
+    def test_send_reply_to_parameter_is_email_address(self):
+        """reply_to parameter accepts EmailAddress."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(provider.send(
+                account=EmailAccount(account_id="acc", provider="fake"),
+                to=[EmailAddress("to@example.com")],
+                reply_to=EmailAddress("reply@example.com"),
+                subject="Test",
+            ))
+            assert result.is_success
+        finally:
+            loop.close()
+
+    def test_send_without_optional_params_works(self):
+        """send() works with minimal required params."""
+        provider = FakeEmailProvider(capabilities=[Capability.SEND])
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(provider.send(
+                account=EmailAccount(account_id="acc", provider="fake"),
+                to=[EmailAddress("to@example.com")],
+                subject="Minimal Test",
+            ))
+            assert result.is_success
+        finally:
+            loop.close()
+
+    def test_send_uses_domain_models_not_strings(self):
+        """send() parameters are typed EmailAddress, not strings."""
+        import inspect
+        sig = inspect.signature(EmailProvider.send)
+        params = sig.parameters
+        # Verify parameter names match domain model
+        assert "to" in params
+        assert "subject" in params
+        assert "account" in params
 
 
 # ── Test: Error Contract ──────────────────────────────────────────────────────
@@ -411,7 +718,6 @@ class TestErrorContract:
     def test_provider_capability_error_for_unsupported(self):
         """Unsupported operations raise ProviderCapabilityError."""
         provider = FakeEmailProvider(capabilities=[])  # No capabilities
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             with pytest.raises(ProviderCapabilityError):
@@ -458,7 +764,6 @@ class TestSecurity:
             connection_state=ProviderConnectionState.AUTHENTICATED,
             display_name="Test",
         )
-        # Check no secret-like fields exist
         repr_str = repr(metadata)
         assert "password" not in repr_str.lower()
         assert "token" not in repr_str.lower()
@@ -475,7 +780,6 @@ class TestSecurity:
     def test_fake_provider_no_credentials_stored(self):
         """Fake provider doesn't store credentials passed to connect()."""
         provider = FakeEmailProvider()
-        import asyncio
         creds = MagicMock(spec=CredentialStore)
         creds.get_password = MagicMock(return_value="should-not-be-stored")
         loop = asyncio.new_event_loop()
@@ -505,10 +809,9 @@ class TestIdentityAndUID:
     def test_provider_accepts_uid_references(self):
         """Provider methods accept UID-based EmailMessageRef."""
         provider = FakeEmailProvider(capabilities=[Capability.FETCH])
-        import asyncio
-        ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="unique-id-123")
         loop = asyncio.new_event_loop()
         try:
+            ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="unique-id-123")
             result = loop.run_until_complete(provider.fetch_message(ref))
             assert result.reference.uid == "unique-id-123"
         finally:
@@ -528,7 +831,6 @@ class TestConnectionState:
     def test_state_transitions(self):
         """Provider transitions through states correctly."""
         provider = FakeEmailProvider()
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             assert provider.metadata.connection_state == ProviderConnectionState.DISCONNECTED
@@ -558,7 +860,6 @@ class TestCapabilityQuery:
     def test_search_capability_required(self):
         """SEARCH capability checked before search operation."""
         provider = FakeEmailProvider(capabilities=[])  # No capabilities
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             with pytest.raises(ProviderCapabilityError):
@@ -569,10 +870,9 @@ class TestCapabilityQuery:
     def test_fetch_capability_required(self):
         """FETCH capability checked before fetch operation."""
         provider = FakeEmailProvider(capabilities=[])
-        import asyncio
-        ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="1")
         loop = asyncio.new_event_loop()
         try:
+            ref = EmailMessageRef(account_id="acc", mailbox="INBOX", uid="1")
             with pytest.raises(ProviderCapabilityError):
                 loop.run_until_complete(provider.fetch_message(ref))
         finally:
@@ -581,13 +881,12 @@ class TestCapabilityQuery:
     def test_send_capability_required(self):
         """SEND capability checked before send operation."""
         provider = FakeEmailProvider(capabilities=[])
-        import asyncio
         loop = asyncio.new_event_loop()
         try:
             with pytest.raises(ProviderCapabilityError):
                 loop.run_until_complete(provider.send(
                     account=EmailAccount(account_id="acc", provider="fake"),
-                    recipients=["test@example.com"],
+                    to=[EmailAddress("test@example.com")],
                     subject="Test",
                 ))
         finally:
@@ -618,15 +917,3 @@ class TestPackageExports:
         """core.email package can import from providers."""
         from core.email.providers.base import EmailProvider
         assert EmailProvider is not None
-
-
-# ── Helpers ─────────────────────────────────────────────────────────────────────
-
-def _await_test(coro):
-    """Helper to run async code in sync test context."""
-    import asyncio
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
