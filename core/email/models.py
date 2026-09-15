@@ -88,7 +88,23 @@ class EmailAccount:
         if self.primary_address is not None and not isinstance(self.primary_address, EmailAddress):
             self.primary_address = EmailAddress(self.primary_address)
         self.aliases = [a if isinstance(a, EmailAddress) else EmailAddress(a) for a in self.aliases]
-        if self.server_config is not None and not isinstance(self.server_config, EmailServerConfig):
+
+        # Compatibility boundary for pre-foundation callers that supplied
+        # server settings through the capabilities field. Never retain that
+        # dictionary as capabilities; normalize it into server_config.
+        if isinstance(self.capabilities, dict):
+            legacy = dict(self.capabilities)
+            self.capabilities = [str(v) for v in legacy.get("capabilities", [])]
+            if self.server_config is None:
+                self.server_config = EmailServerConfig(
+                    imap_host=legacy.get("imap_server") or legacy.get("imap_host") or "",
+                    imap_port=int(legacy.get("imap_port", 993)),
+                    smtp_host=legacy.get("smtp_server") or legacy.get("smtp_host"),
+                    smtp_port=(int(legacy["smtp_port"]) if legacy.get("smtp_port") is not None else None),
+                    imap_security=legacy.get("imap_security", "ssl"),
+                    smtp_security=legacy.get("smtp_security", "starttls"),
+                )
+        elif self.server_config is not None and not isinstance(self.server_config, EmailServerConfig):
             if isinstance(self.server_config, dict):
                 self.server_config = EmailServerConfig(**self.server_config)
             else:
