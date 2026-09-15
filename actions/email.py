@@ -162,6 +162,7 @@ def read_emails(
         folder    : IMAP folder to read from (default: 'INBOX')
         unread_only: if True, only fetch unread emails
         keyword   : optional subject/body keyword filter
+        detail    : if True, show full email body instead of preview
     """
     try:
         params      = parameters or {}
@@ -174,6 +175,7 @@ def read_emails(
         folder      = (params.get("folder") or "INBOX").upper()
         unread_only = bool(params.get("unread_only", False))
         keyword     = (params.get("keyword") or "").strip().lower()
+        detail      = bool(params.get("detail", False))
     except RuntimeError as e:
         return str(e)
 
@@ -197,9 +199,61 @@ def read_emails(
             mail.logout()
             return "No emails found."
 
-        # Get the most recent `limit` messages
+        # If a keyword is provided, use IMAP SEARCH to filter at the server level
+        # instead of downloading every email and filtering in Python
         recent_ids = msg_ids[-limit:]
-        recent_ids.reverse()  # newest first
+        recent_ids.reverse()  # default: newest first
+        keyword_ids_found = False
+
+        if keyword:
+            # Detect search intent from natural language patterns
+            search_type = "text"  # default
+            lower_kw = keyword.lower()
+            if "from" in lower_kw and not keyword.startswith("from"):
+                search_type = "from"
+            elif "subject" in lower_kw:
+                search_type = "subject"
+            elif "sender" in lower_kw or "sent by" in lower_kw:
+                search_type = "from"
+            elif "body" in lower_kw or "content" in lower_kw:
+                search_type = "body"
+
+            # Try multiple IMAP SEARCH strategies
+            keyword_ids = []
+            search_terms = []
+            if search_type == "from":
+                search_terms = [f'(FROM "{keyword}")', f'(TEXT "{keyword}")']
+            else:
+                search_terms = [
+                    f'(TEXT "{keyword}")',    # Full-text (most reliable on Gmail/Outlook)
+                    f'(SUBJECT "{keyword}")', # Subject line
+                    f'(BODY "{keyword}")',    # Body content
+                    f'(FROM "{keyword}")',    # Sender
+                ]
+
+            for search_term in search_terms:
+                try:
+                    status, resp = mail.search(None, search_term.encode())
+                    if status == "OK" and resp[0]:
+                        raw_ids = resp[0].split()
+                        if raw_ids:
+                            keyword_ids = raw_ids
+                            break
+                except Exception:
+                    continue
+
+            if keyword_ids:
+                keyword_id_set = set(keyword_ids)
+                # Intersect with all inbox IDs to stay valid
+                recent_ids = [mid for mid in msg_ids if mid in keyword_id_set]
+                if recent_ids:
+                    recent_ids = recent_ids[-limit:]
+                    recent_ids.reverse()
+                else:
+                    # No overlap with inbox — use keyword results directly
+                    recent_ids = keyword_ids[-limit:]
+                    recent_ids.reverse()
+                keyword_ids_found = True
 
         results = []
         for msg_id in recent_ids:
@@ -207,9 +261,9 @@ def read_emails(
             if status != "OK" or not msg_data or not msg_data[0]:
                 continue
             raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
-            email_msg = _parse_raw_email(raw)
+            email_msg = _parse_raw_email(raw, full=detail)
 
-            if keyword and keyword not in (
+            if keyword and not keyword_ids_found and keyword not in (
                 email_msg.get("subject", "") + email_msg.get("from", "") + email_msg.get("body", "")
             ).lower():
                 continue
@@ -223,12 +277,19 @@ def read_emails(
 
         lines = [f"Recent emails in {folder} ({len(results)} shown):", ""]
         for i, em in enumerate(results, 1):
-            preview = em.get("body", "")[:120].replace("\n", " ")
-            lines.append(
-                f"{i}. [{em.get('date', '?')}] {em.get('from', '?')}: {em.get('subject', '(no subject)')}"
-            )
-            if preview:
-                lines.append(f"   {preview}")
+            if detail:
+                # Show full email when detail mode is on
+                lines.append(f"{i}. [{em.get('date', '?')}] {em.get('from', '?')}: {em.get('subject', '(no subject)')}")
+                lines.append("")
+                lines.append(em.get("body", ""))
+            else:
+                # Show preview in list mode
+                preview = em.get("body", "")[:120].replace("\n", " ")
+                lines.append(
+                    f"{i}. [{em.get('date', '?')}] {em.get('from', '?')}: {em.get('subject', '(no subject)')}"
+                )
+                if preview:
+                    lines.append(f"   {preview}")
             lines.append("")
 
         return "\n".join(lines)
@@ -241,7 +302,7 @@ def read_emails(
         return f"Could not read emails: {err_msg}"
 
 
-def _parse_raw_email(raw: bytes) -> dict:
+def _parse_raw_email(raw: bytes, full: bool = False) -> dict:
     """Parse raw MIME bytes into a structured dict."""
     import email
     msg = email.message_from_bytes(raw)
@@ -283,11 +344,13 @@ def _parse_raw_email(raw: bytes) -> dict:
         except Exception:
             pass
 
+    # Return full body when requested, truncated otherwise
+    max_len = 5000 if full else 500
     return {
         "date":    date_str,
         "from":    from_str,
         "subject": subj,
-        "body":    body.strip()[:500],
+        "body":    body.strip()[:max_len],
     }
 
 
@@ -423,6 +486,10 @@ TOOL = {
             "keyword": {
                 "type": "STRING",
                 "description": "Optional keyword filter on subject/body/from.",
+            },
+            "detail": {
+                "type": "BOOLEAN",
+                "description": "If True, show full email body instead of preview.",
             },
             # Configure params
             "email_address": {

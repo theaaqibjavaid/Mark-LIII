@@ -400,6 +400,88 @@ def _format_event_detail(ev: dict) -> str:
     return "\n".join(lines)
 
 
+def edit_event(
+    parameters: dict,
+    player=None,
+    session_memory=None,
+) -> str:
+    """
+    Edit an existing calendar event by ID or keyword.
+    Updates title, date, time, duration, location, or note.
+    """
+    params     = parameters or {}
+    event_id   = params.get("event_id", "").strip()
+    keyword    = params.get("keyword", "").strip()
+
+    data    = _load()
+    events  = data.get("events", [])
+    target  = None
+
+    if event_id:
+        try:
+            eid = int(event_id)
+        except ValueError:
+            return f"Could not parse event ID: {event_id}"
+        for ev in events:
+            if ev.get("id") == eid:
+                target = ev
+                break
+        if target is None:
+            return f"Event #{eid} not found."
+    elif keyword:
+        matches = [
+            ev for ev in events
+            if keyword.lower() in ev.get("title", "").lower()
+            or keyword.lower() in ev.get("note", "").lower()
+        ]
+        if not matches:
+            return f"No events matching '{keyword}'."
+        if len(matches) > 1:
+            list_str = "\n".join(f"  #{m['id']}. {m['title']}" for m in matches)
+            return f"Multiple matches for '{keyword}':\n{list_str}\nSpecify an event_id to edit a specific one."
+        target = matches[0]
+    else:
+        return "Provide an event_id or keyword to edit an event."
+
+    # Apply updates
+    for field in ("title", "location", "note"):
+        if field in params and params[field]:
+            target[field] = str(params[field]).strip()
+
+    # Handle date/time updates
+    if "when" in params and params["when"]:
+        start, end = _parse_datetime(params["when"])
+        target["start"] = start.isoformat()
+        target["end"] = end.isoformat()
+    elif "date" in params and params["date"]:
+        dt = _parse_date(params["date"])
+        tm = _parse_time(params["time"], dt) if ("time" in params and params["time"]) else dt
+        target["start"] = (tm or dt).isoformat()
+        duration_hrs = float(params.get("duration_hours", params.get("duration", 1)))
+        target["end"] = (datetime.fromisoformat(target["start"]) + timedelta(hours=duration_hrs)).isoformat()
+    elif "time" in params and params["time"]:
+        # Time-only update: keep the existing date, change the time
+        current_start = datetime.fromisoformat(target["start"])
+        tm = _parse_time(params["time"], current_start)
+        if tm:
+            target["start"] = tm.isoformat()
+            duration_hrs = float(params.get("duration_hours", params.get("duration", 1)))
+            target["end"] = (tm + timedelta(hours=duration_hrs)).isoformat()
+
+    duration_param = params.get("duration_hours") or params.get("duration")
+    if duration_param:
+        start = datetime.fromisoformat(target["start"])
+        target["end"] = (start + timedelta(hours=float(duration_param))).isoformat()
+
+    target["updated"] = _now_str()
+    _save(data)
+
+    if player:
+        player.write_log(f"[Calendar] Edited: {target.get('title', 'event')}")
+
+    return f"Event updated: {_event_to_spoken(target)}"
+
+
 def delete_event(
     parameters: dict,
     player=None,
@@ -489,17 +571,33 @@ def calendar(parameters: dict, player=None, session_memory=None) -> str:
     action  = (params.get("action") or "").lower().strip()
     text    = (params.get("text") or "").strip()
 
+    # Auto-detect intent from text when no explicit action is provided
+    if not action and text:
+        lower_text = text.lower()
+        if any(word in lower_text for word in ("edit", "change", "update", "modify", "reschedule", "move", "adjust")):
+            action = "edit"
+        elif any(word in lower_text for word in ("delete", "remove", "cancel", "clear", "erase")):
+            action = "delete"
+        elif any(word in lower_text for word in ("list", "show", "what", "when", "schedule", "calendar")):
+            action = "list"
+        elif any(word in lower_text for word in ("find", "look", "get", "search", "where")):
+            action = "get"
+        else:
+            action = "create"
+
     if action == "create" or (not action and text):
         return create_event(params, player, session_memory)
     if action == "list":
         return list_events(params, player, session_memory)
     if action == "get":
         return get_event(params, player, session_memory)
+    if action in ("edit", "update", "modify"):
+        return edit_event(params, player, session_memory)
     if action == "delete":
         return delete_event(params, player, session_memory)
     if action == "clear":
         return clear_events(params, player, session_memory)
-    return f"Unknown action: '{action}'. Use create, list, get, delete, or clear."
+    return f"Unknown action: '{action}'. Use create, list, get, edit, delete, or clear."
 
 
 # ── Tool declaration ───────────────────────────────────────────────────────────
@@ -509,9 +607,10 @@ TOOL = {
     "description": (
         "Manage a local calendar. Use for: creating events ("
         "'remind me to call mom at 5pm tomorrow'), listing events "
-        "('what's on my calendar today'), getting event details, deleting "
-        "events, or clearing past events. Events are stored locally and "
-        "survive across sessions. Does not require an internet connection."
+        "('what's on my calendar today'), getting event details, "
+        "editing events ('change my meeting to 3pm'), deleting "
+        "events, or clearing past events. Events are stored locally "
+        "and survive across sessions. Does not require an internet connection."
     ),
     "parameters": {
         "type": "OBJECT",

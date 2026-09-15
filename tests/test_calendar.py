@@ -389,7 +389,61 @@ class TestDeleteEvent:
     def test_delete_nonexistent(self, calendar_module):
         import actions.calendar as cal
         result = cal.delete_event({"event_id": "999"})
-        assert "not found" in result.lower() or "found" in result.lower()
+        assert "found" in result.lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Edit event
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEditEvent:
+    def test_edit_by_id_changes_title(self, calendar_module, player):
+        import actions.calendar as cal
+        cal.create_event({"title": "Old Title", "date": "2025-09-01", "time": "10:00"})
+        result = cal.edit_event({"event_id": "1", "title": "New Title"}, player)
+        assert "updated" in result.lower()
+        data = cal._load()
+        assert data["events"][0]["title"] == "New Title"
+        player.write_log.assert_called_once()
+
+    def test_edit_by_id_changes_time(self, calendar_module):
+        import actions.calendar as cal
+        cal.create_event({"title": "Meeting", "date": "2025-09-01", "time": "10:00"})
+        cal.edit_event({"event_id": "1", "time": "14:00"})
+        data = cal._load()
+        assert data["events"][0]["start"] == "2025-09-01T14:00:00"
+
+    def test_edit_by_id_changes_location(self, calendar_module):
+        import actions.calendar as cal
+        cal.create_event({"title": "Meeting", "date": "2025-09-01", "time": "10:00"})
+        cal.edit_event({"event_id": "1", "location": "Zoom Room"})
+        data = cal._load()
+        assert data["events"][0]["location"] == "Zoom Room"
+
+    def test_edit_by_id_changes_date(self, calendar_module):
+        import actions.calendar as cal
+        cal.create_event({"title": "Meeting", "date": "2025-09-01", "time": "10:00"})
+        cal.edit_event({"event_id": "1", "date": "2025-10-15", "time": "15:00"})
+        data = cal._load()
+        assert data["events"][0]["start"] == "2025-10-15T15:00:00"
+
+    def test_edit_by_keyword(self, calendar_module):
+        import actions.calendar as cal
+        cal.create_event({"title": "Dentist", "date": "2025-09-01", "time": "10:00"})
+        result = cal.edit_event({"keyword": "Dentist", "title": "Doctor"})
+        assert "updated" in result.lower()
+        data = cal._load()
+        assert data["events"][0]["title"] == "Doctor"
+
+    def test_edit_nonexistent_id(self, calendar_module):
+        import actions.calendar as cal
+        result = cal.edit_event({"event_id": "999", "title": "X"})
+        assert "not found" in result.lower()
+
+    def test_edit_no_params(self, calendar_module):
+        import actions.calendar as cal
+        result = cal.edit_event({})
+        assert "Provide" in result or "found" in result.lower()
 
 
 class TestClearEvents:
@@ -422,10 +476,25 @@ class TestClearEvents:
 class TestCalendarUnified:
     def test_auto_detect_create_from_text(self, calendar_module):
         import actions.calendar as cal
-        # When text is provided but no explicit action, it routes to create
         result = cal.calendar({"text": "remind me to call mom tomorrow at 5pm",
                                "title": "Call mom", "when": "tomorrow at 5pm"})
         assert "Event created" in result
+
+    def test_auto_detect_edit_from_text(self, calendar_module):
+        """Text containing 'edit'/'change' should route to edit_event."""
+        import actions.calendar as cal
+        cal.create_event({"title": "Meeting", "date": "2025-06-15", "time": "10:00"})
+        result = cal.calendar({"text": "change my meeting to 3pm", "event_id": "1", "time": "15:00"})
+        assert "updated" in result.lower()
+        data = cal._load()
+        assert data["events"][0]["start"] == "2025-06-15T15:00:00"
+
+    def test_auto_detect_delete_from_text(self, calendar_module):
+        """Text containing 'delete' should route to delete_event."""
+        import actions.calendar as cal
+        cal.create_event({"title": "ToDelete", "date": "2025-06-15", "time": "10:00"})
+        result = cal.calendar({"text": "delete my ToDelete event", "event_id": "1"})
+        assert "Deleted" in result
 
     def test_unknown_action(self, calendar_module):
         import actions.calendar as cal

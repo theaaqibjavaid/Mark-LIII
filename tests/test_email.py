@@ -234,6 +234,59 @@ class TestReadEmails:
             result = read_emails({"limit": 999})
             assert "X" in result  # succeeds despite capped limit
 
+    def test_keyword_search_uses_imap_text_search(self, valid_config):
+        """When keyword is provided, IMAP TEXT search should be attempted."""
+        with patch("actions.email.IMAP4_SSL") as MockIMAP:
+            mock_mail = MagicMock()
+            MockIMAP.return_value = mock_mail
+            # First search (ALL) returns 3 emails
+            mock_mail.search.side_effect = [
+                ("OK", [b"1 2 3"]),  # ALL search
+                ("OK", [b"2"]),       # TEXT search for keyword
+            ]
+            raw = b"From: sender@test.com\r\nSubject: Test Subject\r\n\r\nBody text"
+            mock_mail.fetch.return_value = ("OK", [(b"2", raw)])
+            mock_mail.logout = MagicMock()
+
+            result = read_emails({"keyword": "test"})
+            assert "Test Subject" in result
+            # Verify TEXT search was attempted
+            call_args = [str(c[0][1]) for c in mock_mail.search.call_args_list]
+            assert any('TEXT' in c for c in call_args), "IMAP TEXT search should be attempted"
+
+    def test_keyword_search_fallback_to_subject(self, valid_config):
+        """If TEXT search returns nothing, SUBJECT search should be tried."""
+        with patch("actions.email.IMAP4_SSL") as MockIMAP:
+            mock_mail = MagicMock()
+            MockIMAP.return_value = mock_mail
+            mock_mail.search.side_effect = [
+                ("OK", [b"1 2 3"]),       # ALL search
+                ("OK", [b""]),             # TEXT search - no results
+                ("OK", [b"1"]),            # SUBJECT search - found match
+            ]
+            raw = b"From: sender@test.com\r\nSubject: Urgent Report\r\n\r\nImportant body"
+            mock_mail.fetch.return_value = ("OK", [(b"1", raw)])
+            mock_mail.logout = MagicMock()
+
+            result = read_emails({"keyword": "urgent"})
+            assert "Urgent Report" in result
+
+    def test_keyword_search_from_pattern(self, valid_config):
+        """'from John' should trigger FROM search."""
+        with patch("actions.email.IMAP4_SSL") as MockIMAP:
+            mock_mail = MagicMock()
+            MockIMAP.return_value = mock_mail
+            mock_mail.search.side_effect = [
+                ("OK", [b"1 2 3"]),       # ALL search
+                ("OK", [b"3"]),            # FROM search for 'john'
+            ]
+            raw = b"From: john@example.com\r\nSubject: Hello\r\n\r\nHey there"
+            mock_mail.fetch.return_value = ("OK", [(b"3", raw)])
+            mock_mail.logout = MagicMock()
+
+            result = read_emails({"keyword": "from john"})
+            assert "Hello" in result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # configure_email
@@ -289,21 +342,29 @@ class TestParseRawEmail:
         assert result["subject"] == "Hello World"
         assert "body text" in result["body"]
 
-    def test_multipart_email(self):
+    def test_parse_raw_email_full_body(self):
+        """Full body mode should return more than 500 chars."""
         raw = (
-            b"From: a@b.com\r\n"
-            b"Subject: Multipart\r\n"
-            b"MIME-Version: 1.0\r\n"
-            b"Content-Type: multipart/alternative; boundary=BOUNDARY\r\n"
+            b"From: sender@test.com\r\n"
+            b"Subject: Long Email\r\n"
             b"\r\n"
-            b"--BOUNDARY\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n"
-            b"\r\n"
-            b"Plain text body\r\n"
-            b"--BOUNDARY--\r\n"
+            + b"A" * 600  # Body longer than 500 chars
         )
-        result = _parse_raw_email(raw)
-        assert "Plain text body" in result["body"]
+        result = _parse_raw_email(raw, full=True)
+        assert len(result["body"]) > 500
+        assert result["body"] == "A" * 600
+
+    def test_parse_raw_email_truncated_body(self):
+        """Default mode should truncate body at 500 chars."""
+        raw = (
+            b"From: sender@test.com\r\n"
+            b"Subject: Long Email\r\n"
+            b"\r\n"
+            + b"B" * 600
+        )
+        result = _parse_raw_email(raw, full=False)
+        assert len(result["body"]) == 500
+        assert result["body"] == "B" * 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

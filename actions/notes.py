@@ -281,7 +281,7 @@ def search_notes(
 
     lines = [f"Search results for '{query}' ({len(results)} found):", ""]
     for r in results:
-        lines.append(f"  📝 {r['title']} (#{r['id']})")
+        lines.append(f"  - {r['title']} (#{r['id']})")
         lines.append(f"     {r['snippet'][:150]}")
         lines.append("")
 
@@ -324,13 +324,8 @@ def update_note(
     except Exception as e:
         return f"Could not read note #{nid}: {e}"
 
-    new_title = (params.get("title") or "").strip()
-    content   = (params.get("content") or params.get("text") or "").strip()
-    append    = bool(params.get("append", False))
-
     # If no content provided but title is, just update the title
     if not content and new_title:
-        # Only update header
         header_lines = []
         for line in existing.splitlines():
             if line.startswith("# "):
@@ -339,7 +334,14 @@ def update_note(
                 header_lines.append(f"**Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             else:
                 header_lines.append(line)
-        note_file.write_text("\n".join(header_lines) + "\n" + existing.split("---", 1)[1] if "---" in existing else "\n".join(header_lines), encoding="utf-8")
+        new_header = "\n".join(header_lines)
+        # Preserve everything after the --- separator
+        sep_idx = existing.find("\n---")
+        if sep_idx != -1:
+            body_part = existing[sep_idx:]
+        else:
+            body_part = ""
+        note_file.write_text(new_header + body_part, encoding="utf-8")
 
         data = _load_index()
         info = data["notes"].get(str(nid))
