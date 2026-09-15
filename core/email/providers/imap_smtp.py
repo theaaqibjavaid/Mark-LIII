@@ -24,7 +24,7 @@ from datetime import datetime
 from email.header import decode_header
 from email.utils import parseaddr, formatdate
 from imaplib import IMAP4_SSL
-from typing import Optional
+from typing import Any, Optional
 
 from ..credentials import CredentialStore
 from ..errors import (
@@ -73,30 +73,88 @@ class _AsyncIMAPWrapper:
 
     async def list(self) -> tuple[str, list]:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._imap.list)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._imap.list),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
 
     async def select(self, folder: str, readonly: bool = False) -> tuple[str, list]:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._imap.select, folder, readonly)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._imap.select, folder, readonly),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
 
     async def uid(self, command: str, *args) -> tuple[str, list]:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._imap.uid, command, *args)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._imap.uid, command, *args),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
 
     async def search(self, charset: Optional[str], criteria: str) -> tuple[str, list]:
+        """Perform IMAP SEARCH command (returns sequence numbers, not UIDs)."""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._imap.search, charset, criteria)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._imap.search, charset, criteria),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
+
+    async def uid_search(self, charset: Optional[str], criteria: str) -> tuple[str, list]:
+        """Perform IMAP UID SEARCH command (returns UIDs)."""
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: self._imap.uid("search", charset, criteria)),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
 
     async def append(self, mailbox: str, flags: str, date: Optional[object], message: bytes) -> tuple[str, list]:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._imap.append, mailbox, flags, date, message)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._imap.append, mailbox, flags, date, message),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
 
     async def logout(self) -> None:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._imap.logout)
+        await asyncio.wait_for(
+            loop.run_in_executor(None, self._imap.logout),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._imap, name)
+
+
+class _AsyncSMTPWrapper:
+    """Wrapper around sync SMTP objects for async usage."""
+
+    def __init__(self, smtp: smtplib.SMTP) -> None:
+        self._smtp = smtp
+
+    async def login(self, user: str, password: str) -> tuple[str, dict]:
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._smtp.login, user, password),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
+
+    async def sendmail(self, from_addr: str, to_addrs: list[str], msg: str) -> dict:
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, self._smtp.sendmail, from_addr, to_addrs, msg),
+            timeout=_DEFAULT_SEND_TIMEOUT,
+        )
+
+    async def quit(self) -> None:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, self._smtp.quit),
+            timeout=_DEFAULT_COMMAND_TIMEOUT,
+        )
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._smtp, name)
 
 
 class ImapSmtpProvider(EmailProvider):
@@ -113,7 +171,7 @@ class ImapSmtpProvider(EmailProvider):
         self._state = ProviderConnectionState.DISCONNECTED
         self._account: Optional[EmailAccount] = None
         self._imap: Optional[_AsyncIMAPWrapper] = None
-        self._smtp: Optional[smtplib.SMTP] = None
+        self._smtp: Optional[_AsyncSMTPWrapper] = None
         self._capabilities = ProviderCapabilities()
         self._current_folder: str = "INBOX"
         self._folder_info_cache: dict[str, EmailFolder] = {}
@@ -122,6 +180,7 @@ class ImapSmtpProvider(EmailProvider):
         self._smtp_host: Optional[str] = smtp_host
         self._smtp_port: Optional[int] = smtp_port
         self._use_tls: bool = use_tls
+        self._credentials: Optional[CredentialStore] = None  # Stored during connect for SMTP auth
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -151,6 +210,7 @@ class ImapSmtpProvider(EmailProvider):
         """Establish IMAP connection and authenticate."""
         self._state = ProviderConnectionState.CONNECTING
         self._account = account
+        self._credentials = credentials  # Store for SMTP auth later
 
         try:
             password = credentials.get_password(
@@ -161,30 +221,37 @@ class ImapSmtpProvider(EmailProvider):
                 self._state = ProviderConnectionState.DISCONNECTED
                 raise AuthenticationError("No password found in credential store")
 
-            # Parse server configuration
+            # Parse server configuration from account.capabilities dict
             caps = account.capabilities or {}
             imap_host = caps.get("imap_server")
             imap_port = caps.get("imap_port", 993)
-            smtp_host = caps.get("smtp_server", "smtp.gmail.com")
-            smtp_port = caps.get("smtp_port", 587)
+            
+            # Require explicit SMTP configuration - no defaults
+            smtp_host = caps.get("smtp_server")
+            smtp_port = caps.get("smtp_port", 587 if self._use_tls else 25)
 
             if not imap_host:
                 self._state = ProviderConnectionState.DISCONNECTED
-                raise ConnectionError("IMAP server not configured")
-
-            self._imap_host = imap_host
-            self._imap_port = imap_port
-            self._smtp_host = smtp_host
-            self._smtp_port = smtp_port
+                raise ConnectionError("IMAP server not configured in account.capabilities")
+            
+            if not smtp_host:
+                logger.warning("SMTP server not configured - can only receive, not send")
 
             connect_timeout = timeout if timeout is not None else _DEFAULT_CONNECT_TIMEOUT
 
             # Establish IMAP connection with TLS
             try:
                 loop = asyncio.get_event_loop()
-                self._imap = _AsyncIMAPWrapper(await loop.run_in_executor(
-                    None, lambda: IMAP4_SSL(imap_host, imap_port, timeout=connect_timeout)
-                ))
+                if self._use_tls:
+                    self._imap = _AsyncIMAPWrapper(await loop.run_in_executor(
+                        None, lambda: IMAP4_SSL(imap_host, imap_port, timeout=connect_timeout)
+                    ))
+                else:
+                    # Plain IMAP (not recommended, use with caution)
+                    from imaplib import IMAP4
+                    self._imap = _AsyncIMAPWrapper(await loop.run_in_executor(
+                        None, lambda: IMAP4(imap_host, imap_port, timeout=connect_timeout)
+                    ))
             except asyncio.TimeoutError:
                 self._state = ProviderConnectionState.DISCONNECTED
                 raise TimeoutError(f"IMAP connection to {imap_host}:{imap_port} timed out")
@@ -238,7 +305,7 @@ class ImapSmtpProvider(EmailProvider):
 
             if self._smtp is not None:
                 try:
-                    self._smtp.quit()
+                    await self._smtp.quit()
                 except Exception:
                     pass
                 finally:
@@ -247,6 +314,7 @@ class ImapSmtpProvider(EmailProvider):
         finally:
             self._state = ProviderConnectionState.DISCONNECTED
             self._account = None
+            self._credentials = None  # Clear credentials for security
             self._current_folder = "INBOX"
             self._folder_info_cache.clear()
 
@@ -279,7 +347,7 @@ class ImapSmtpProvider(EmailProvider):
             raise ConnectionError(f"Failed to list folders: {e}")
 
     async def get_folder_info(self, folder_name: str) -> EmailFolder:
-        """Get metadata about a specific mailbox."""
+        """Get metadata about a specific mailbox without changing selection."""
         self._require_connected()
         self._require_capability(Capability.FOLDERS)
 
@@ -287,8 +355,19 @@ class ImapSmtpProvider(EmailProvider):
             return self._folder_info_cache[folder_name]
 
         try:
-            await self.select_folder(folder_name)
-            return self._folder_info_cache.get(folder_name, EmailFolder(provider_name=folder_name))
+            # Use LIST to get metadata without selecting
+            status, responses = await self._imap.list()
+            if status == "OK":
+                for resp in responses:
+                    if isinstance(resp, bytes):
+                        resp = resp.decode("utf-8", errors="replace")
+                    folder = self._parse_folder_line(resp)
+                    if folder and folder.provider_name == folder_name:
+                        return folder
+
+            # Fallback: try to select (may change current folder)
+            return await self.select_folder(folder_name)
+            
         except MailboxNotFoundError:
             raise
         except Exception as e:
@@ -317,22 +396,46 @@ class ImapSmtpProvider(EmailProvider):
     # ── Search ────────────────────────────────────────────────────────────────
 
     async def search(self, query: EmailSearchQuery) -> list[EmailMessageRef]:
-        """Search messages using IMAP SEARCH with UID identity."""
+        """Search messages using IMAP UID SEARCH with UID identity."""
         self._require_connected()
         self._require_capability(Capability.SEARCH)
 
         try:
             imap_criteria = self._build_search_criteria(query)
-            limit = query.resolved_limit
+            
+            # Validate query doesn't use unsupported features
+            unsupported_fields = []
+            if query.thread_id:
+                unsupported_fields.append("thread_id")
+            if query.has_attachment is not None:
+                unsupported_fields.append("has_attachment")
+            if query.sort_by:
+                unsupported_fields.append("sort_by")
+            if query.sort_order:
+                unsupported_fields.append("sort_order")
+            if query.offset:
+                unsupported_fields.append("offset")
+            
+            if unsupported_fields:
+                # Log warning but continue - these are hints, not errors
+                logger.warning(
+                    f"Search query fields not fully supported by IMAP: {unsupported_fields}. "
+                    f"Using best-effort mapping."
+                )
 
-            status, data = await self._imap.search(None, imap_criteria)
+            # Use UID SEARCH to get UIDs directly
+            status, data = await self._imap.uid_search(None, imap_criteria)
 
             if status != "OK" or not data or not data[0]:
                 return []
 
             uid_str = data[0].decode("utf-8")
             uids = uid_str.split() if uid_str else []
-            uids = uids[:limit]
+            
+            # Apply limit (cap at resolved_limit)
+            limit = query.resolved_limit
+            if limit is not None:
+                uids = uids[:limit]
 
             return [
                 EmailMessageRef(
@@ -356,13 +459,14 @@ class ImapSmtpProvider(EmailProvider):
         include_body: bool = True,
         include_attachments: bool = False,
     ) -> EmailMessage:
-        """Fetch a complete message using UID FETCH."""
+        """Fetch a complete message using UID FETCH with PEEK to avoid side effects."""
         self._require_connected()
         self._require_capability(Capability.FETCH)
 
         try:
             uid = ref.uid
-            fetch_command = "BODY[]" if include_body else "BODY.PEEK[]"
+            # Use BODY.PEEK[] to avoid setting \Seen flag (RFC 3501 section 6.4.5)
+            fetch_command = "BODY.PEEK[]" if include_body else "BODY.PEEK[HEADER]"
             status, data = await self._imap.uid("fetch", uid, fetch_command)
 
             if status != "OK" or not data:
@@ -372,7 +476,7 @@ class ImapSmtpProvider(EmailProvider):
             if not raw_message:
                 raise MessageNotFoundError(f"Failed to parse message {uid}")
 
-            return self._parse_message(raw_message, ref)
+            return self._parse_message(raw_message, ref, flags=data)
 
         except MessageNotFoundError:
             raise
@@ -380,15 +484,38 @@ class ImapSmtpProvider(EmailProvider):
             raise MessageNotFoundError(f"Failed to fetch message {ref.uid}: {e}")
 
     async def fetch_message_headers(self, ref: EmailMessageRef) -> EmailMessage:
-        """Fetch only message headers (lightweight)."""
-        return await self.fetch_message(ref, include_body=False)
+        """Fetch only message headers (lightweight) using BODY.PEEK[HEADER]."""
+        # Fetch headers only - no body content
+        self._require_connected()
+        self._require_capability(Capability.FETCH)
+
+        try:
+            uid = ref.uid
+            # Explicitly fetch only headers using BODY.PEEK[HEADER]
+            status, data = await self._imap.uid("fetch", uid, "BODY.PEEK[HEADER]")
+
+            if status != "OK" or not data:
+                raise MessageNotFoundError(f"Message {uid} not found")
+
+            raw_message = self._extract_raw_message(data)
+            if not raw_message:
+                raise MessageNotFoundError(f"Failed to parse headers for message {uid}")
+
+            # Parse but don't extract body
+            return self._parse_message_headers_only(raw_message, ref, flags=data)
+
+        except MessageNotFoundError:
+            raise
+        except Exception as e:
+            raise MessageNotFoundError(f"Failed to fetch headers for message {ref.uid}: {e}")
 
     async def fetch_attachments(self, ref: EmailMessageRef) -> list[EmailAttachment]:
-        """Fetch attachment metadata only (no content download)."""
+        """Fetch attachment metadata by parsing message structure."""
         self._require_connected()
         self._require_capability(Capability.ATTACHMENTS)
 
         try:
+            # Fetch full message to parse attachments
             msg = await self.fetch_message(ref, include_body=False)
             return msg.attachments
         except MessageNotFoundError:
@@ -415,7 +542,7 @@ class ImapSmtpProvider(EmailProvider):
         return await self._unset_flag(ref, flag)
 
     async def delete_message(self, ref: EmailMessageRef) -> EmailOperationResult:
-        """Mark message as deleted (moves to trash)."""
+        """Mark message as deleted (moves to trash after EXPUNGE)."""
         self._require_connected()
         self._require_capability(Capability.DELETE)
 
@@ -451,9 +578,17 @@ class ImapSmtpProvider(EmailProvider):
                     affected_refs=[ref],
                 )
 
-            # Fallback: COPY + DELETE
-            await self.copy_message(ref, target_folder)
-            await self.delete_message(ref)
+            # Fallback: COPY + DELETE with proper semantics
+            copy_result = await self.copy_message(ref, target_folder)
+            if copy_result.status != OperationStatus.SUCCESS:
+                raise ConnectionError("Move fallback failed: copy failed")
+            
+            # Delete original
+            delete_result = await self.delete_message(ref)
+            if delete_result.status != OperationStatus.SUCCESS:
+                # Copy succeeded but delete failed - message is now duplicated
+                logger.error(f"Move failed: copy succeeded but delete failed for {ref.uid}")
+                raise ConnectionError(f"Move partially succeeded: copy to {target_folder} succeeded, but delete failed")
 
             return EmailOperationResult(
                 operation_id=f"move-{ref.uid}",
@@ -500,7 +635,7 @@ class ImapSmtpProvider(EmailProvider):
     # ── Thread Operations ─────────────────────────────────────────────────────
 
     async def search_threads(self, query: EmailSearchQuery) -> list[EmailThread]:
-        """Search for message threads (placeholder)."""
+        """Search for message threads (placeholder - IMAP THREAD not widely supported)."""
         self._require_connected()
         self._require_capability(Capability.THREADS)
         return []
@@ -528,6 +663,7 @@ class ImapSmtpProvider(EmailProvider):
             if status != "OK":
                 raise ConnectionError("Failed to append draft")
 
+            # Get UID of newly created draft
             status, data = await self._imap.uid("search", None, "ALL")
             uid_str = data[0].decode("utf-8").split()[-1] if data[0] else ""
 
@@ -577,11 +713,27 @@ class ImapSmtpProvider(EmailProvider):
         if not all_recipients:
             raise InvalidRecipientError("No recipients specified")
 
+        # Validate attachments
         if attachments:
+            # Check individual attachment size
+            for att in attachments:
+                if att.byte_size > EmailLimits.MAX_ATTACHMENT_SIZE_BYTES:
+                    raise AttachmentTooLargeError(
+                        f"Attachment '{att.filename}' size {att.byte_size} exceeds limit"
+                    )
+            
+            # Check attachment count
+            if len(attachments) > EmailLimits.MAX_ATTACHMENT_COUNT:
+                raise AttachmentTooLargeError(
+                    f"Attachment count {len(attachments)} exceeds limit"
+                )
+            
+            # Check total size
             total_size = sum(a.byte_size for a in attachments)
-            if total_size > EmailLimits.MAX_TOTAL_ATTACHMENT_SIZE:
+            if total_size > EmailLimits.MAX_TOTAL_ATTACHMENT_SIZE_BYTES:
                 raise AttachmentTooLargeError(f"Total attachment size {total_size} exceeds limit")
 
+        # Ensure SMTP connection
         smtp_connected = self._smtp is not None
         if not smtp_connected:
             await self._connect_smtp(account)
@@ -599,15 +751,18 @@ class ImapSmtpProvider(EmailProvider):
             if bcc:
                 all_addrs.extend([r.address for r in bcc])
 
-            send_timeout = _DEFAULT_SEND_TIMEOUT
+            # Enforce send timeout
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: self._smtp.sendmail(
-                    account.primary_address.address if account.primary_address else account.account_id,
-                    all_addrs,
-                    message.as_string(),
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self._smtp.sendmail(
+                        account.primary_address.address if account.primary_address else account.account_id,
+                        all_addrs,
+                        message.as_string(),
+                    ),
                 ),
+                timeout=_DEFAULT_SEND_TIMEOUT,
             )
 
             return EmailOperationResult(
@@ -696,8 +851,11 @@ class ImapSmtpProvider(EmailProvider):
     async def _find_archive_folder(self) -> Optional[str]:
         folders = await self.list_folders()
         for folder in folders:
+            # Prefer special-use flags
             if folder.special_use and "\\Archive" in folder.special_use:
                 return folder.provider_name
+        # Fallback to name-based detection (less reliable)
+        for folder in folders:
             if folder.provider_name.lower() in ("archive", "archives"):
                 return folder.provider_name
         return None
@@ -705,11 +863,15 @@ class ImapSmtpProvider(EmailProvider):
     async def _get_drafts_folder(self) -> str:
         folders = await self.list_folders()
         for folder in folders:
+            # Prefer special-use flags
             if folder.special_use and "\\Drafts" in folder.special_use:
                 return folder.provider_name
+        # Fallback to name-based detection
+        for folder in folders:
             if folder.provider_name.lower() in ("drafts", "draft"):
                 return folder.provider_name
-        return "Drafts"
+        # Explicitly raise if no drafts folder found
+        raise MailboxNotFoundError("No Drafts folder found")
 
     def _parse_folder_line(self, line: str) -> Optional[EmailFolder]:
         try:
@@ -761,6 +923,9 @@ class ImapSmtpProvider(EmailProvider):
                 if flag.startswith("\\"):
                     criteria.append(flag)
 
+        # Note: thread_id, has_attachment, sort_by, sort_order, offset are not supported by IMAP SEARCH
+        # They are silently ignored as per IMAP protocol limitations
+
         return " ".join(criteria) if criteria else "ALL"
 
     def _extract_raw_message(self, data: list) -> Optional[bytes]:
@@ -773,10 +938,34 @@ class ImapSmtpProvider(EmailProvider):
                 inner = response[1]
                 if isinstance(inner, tuple) and len(inner) >= 2:
                     return inner[1]
+                elif isinstance(inner, bytes):
+                    return inner
 
         return None
 
-    def _parse_message(self, raw: bytes, ref: EmailMessageRef) -> EmailMessage:
+    def _parse_flags_from_response(self, data: list) -> list[str]:
+        """Extract IMAP flags from FETCH response metadata."""
+        flags = []
+        if not data or not data[0]:
+            return flags
+        
+        response = data[0]
+        if isinstance(response, tuple):
+            for item in response:
+                if isinstance(item, bytes):
+                    flag_str = item.decode('utf-8', errors='replace')
+                    if flag_str.startswith('\\'):
+                        flags.append(flag_str)
+                elif isinstance(item, tuple):
+                    for sub_item in item:
+                        if isinstance(sub_item, bytes):
+                            flag_str = sub_item.decode('utf-8', errors='replace')
+                            if flag_str.startswith('\\'):
+                                flags.append(flag_str)
+        
+        return flags
+
+    def _parse_message(self, raw: bytes, ref: EmailMessageRef, flags: Optional[list] = None) -> EmailMessage:
         from email.parser import BytesParser
 
         parser = BytesParser()
@@ -797,6 +986,7 @@ class ImapSmtpProvider(EmailProvider):
         subject = self._decode_header(msg.get("Subject", ""))
         date_str = msg.get("Date", "")
         date = None
+
         if date_str:
             try:
                 from email.utils import parsedate_to_datetime
@@ -804,17 +994,11 @@ class ImapSmtpProvider(EmailProvider):
             except Exception:
                 pass
 
-        flags = []
-        if b"\\Seen" in raw:
-            flags.append("\\Seen")
-        if b"\\Answered" in raw:
-            flags.append("\\Answered")
-        if b"\\Flagged" in raw:
-            flags.append("\\Flagged")
-        if b"\\Deleted" in raw:
-            flags.append("\\Deleted")
-        if b"\\Draft" in raw:
-            flags.append("\\Draft")
+        # Extract flags from IMAP response metadata, not from message content
+        message_flags = self._parse_flags_from_response(flags) if flags else []
+
+        # Parse attachments from MIME structure
+        attachments = self._extract_attachments(msg)
 
         return EmailMessage(
             reference=ref,
@@ -822,11 +1006,100 @@ class ImapSmtpProvider(EmailProvider):
             recipients=recipients,
             subject=subject,
             date=date,
-            flags=flags,
+            flags=message_flags,
             body_plain=self._extract_body(raw, "plain"),
             body_html=self._extract_body(raw, "html"),
+            attachments=attachments,
             provider_metadata={"raw_size": len(raw)},
         )
+
+    def _parse_message_headers_only(self, raw: bytes, ref: EmailMessageRef, flags: Optional[list] = None) -> EmailMessage:
+        """Parse message headers only - no body content extraction."""
+        from email.parser import BytesParser
+
+        parser = BytesParser()
+        msg = parser.parsebytes(raw)
+
+        sender_str = msg.get("From", "")
+        sender_name, sender_addr = parseaddr(sender_str)
+        sender = EmailAddress(sender_addr, sender_name)
+
+        to_str = msg.get("To", "")
+        to_names, to_addrs = [], []
+        for addr in to_str.split(","):
+            name, email = parseaddr(addr.strip())
+            to_names.append(name)
+            to_addrs.append(email)
+        recipients = [EmailAddress(addr, name) for name, addr in zip(to_names, to_addrs)]
+
+        subject = self._decode_header(msg.get("Subject", ""))
+        date_str = msg.get("Date", "")
+        date = None
+
+        if date_str:
+            try:
+                from email.utils import parsedate_to_datetime
+                date = parsedate_to_datetime(date_str)
+            except Exception:
+                pass
+
+        # Extract flags from IMAP response metadata
+        message_flags = self._parse_flags_from_response(flags) if flags else []
+
+        # Parse attachment metadata only (no content)
+        attachments = self._extract_attachment_metadata(msg)
+
+        return EmailMessage(
+            reference=ref,
+            sender=sender,
+            recipients=recipients,
+            subject=subject,
+            date=date,
+            flags=message_flags,
+            body_plain=None,  # No body content for header-only fetch
+            body_html=None,
+            attachments=attachments,
+            provider_metadata={"raw_size": len(raw)},
+        )
+
+    def _extract_attachments(self, msg: object) -> list[EmailAttachment]:
+        """Extract full attachment metadata including content handles."""
+        attachments = []
+        from email.mime.base import MIMEBase
+        
+        if hasattr(msg, 'walk'):
+            for part in msg.walk():
+                if part.get_content_disposition() == 'attachment':
+                    filename = part.get_filename()
+                    if filename:
+                        # Create attachment metadata
+                        att = EmailAttachment(
+                            attachment_id=f"att_{len(attachments)}",
+                            filename=filename,
+                            content_type=part.get_content_type(),
+                            byte_size=len(part.get_payload(decode=True) or b""),
+                            content_handle=None,  # Content not loaded for memory efficiency
+                        )
+                        attachments.append(att)
+        return attachments
+
+    def _extract_attachment_metadata(self, msg: object) -> list[EmailAttachment]:
+        """Extract attachment metadata only (no content loading)."""
+        attachments = []
+        
+        if hasattr(msg, 'walk'):
+            for part in msg.walk():
+                if part.get_content_disposition() == 'attachment':
+                    filename = part.get_filename()
+                    if filename:
+                        att = EmailAttachment(
+                            attachment_id=f"att_{len(attachments)}",
+                            filename=filename,
+                            content_type=part.get_content_type(),
+                            byte_size=0,  # Don't load content to calculate size
+                        )
+                        attachments.append(att)
+        return attachments
 
     def _extract_body(self, raw: bytes, content_type: str) -> Optional[str]:
         from email import policy
@@ -918,8 +1191,9 @@ class ImapSmtpProvider(EmailProvider):
                         encoders.encode_base64(part)
                         part.add_header("Content-Disposition", f"attachment; filename={att.filename}")
                         msg.attach(part)
-                    except (IOError, OSError):
-                        pass
+                    except (IOError, OSError) as e:
+                        # Re-raise instead of silently dropping
+                        raise AttachmentTooLargeError(f"Failed to read attachment '{att.filename}': {e}")
 
         return msg
 
@@ -937,26 +1211,36 @@ class ImapSmtpProvider(EmailProvider):
 
     async def _connect_smtp(self, account: EmailAccount) -> None:
         """Establish SMTP connection with TLS."""
-        smtp_host = self._smtp_host or "smtp.gmail.com"
-        smtp_port = self._smtp_port or 587
+        smtp_host = self._smtp_host
+        smtp_port = self._smtp_port
+
+        # Use credentials from connect() if available
+        password = None
+        if self._credentials:
+            password = self._credentials.get_password(
+                service=account.provider,
+                username=account.primary_address.address if account.primary_address else account.account_id,
+            )
 
         try:
             loop = asyncio.get_event_loop()
-            self._smtp = await loop.run_in_executor(
-                None,
-                lambda: smtplib.SMTP(smtp_host, smtp_port, timeout=_DEFAULT_CONNECT_TIMEOUT),
-            )
-            self._smtp.starttls()
-
+            if self._use_tls:
+                # SMTP with STARTTLS (port 587 typically)
+                self._smtp = _AsyncSMTPWrapper(await loop.run_in_executor(
+                    None, lambda: smtplib.SMTP(smtp_host, smtp_port, timeout=_DEFAULT_CONNECT_TIMEOUT)
+                ))
+                await loop.run_in_executor(None, self._smtp._smtp.starttls)
+            else:
+                # Implicit TLS (port 465 typically)
+                import smtplib as smtplib_module
+                self._smtp = _AsyncSMTPWrapper(await loop.run_in_executor(
+                    None, lambda: smtplib_module.SMTP_SSL(smtp_host, smtp_port, timeout=_DEFAULT_CONNECT_TIMEOUT)
+                ))
+            
             # Authenticate if credentials available
-            password = None
-            if self._account:
-                password = self._account.capabilities.get("_password") if self._account.capabilities else None
             if password:
-                await loop.run_in_executor(
-                    None,
-                    lambda: self._smtp.login(self._account.account_id, password),
-                )
+                await self._smtp.login(account.account_id, password)
+
         except ssl.SSLError as e:
             raise TLSConfigurationError(f"SMTP TLS failed: {e}")
         except smtplib.SMTPConnectError as e:
@@ -971,7 +1255,7 @@ class ImapSmtpProvider(EmailProvider):
     async def _disconnect_smtp(self) -> None:
         if self._smtp:
             try:
-                self._smtp.quit()
+                await self._smtp.quit()
             except Exception:
                 pass
             finally:
@@ -988,3 +1272,4 @@ class ImapSmtpProvider(EmailProvider):
             finally:
                 self._imap = None
         self._state = ProviderConnectionState.DISCONNECTED
+        self._credentials = None  # Clear credentials on cleanup
