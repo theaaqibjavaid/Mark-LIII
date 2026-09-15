@@ -56,6 +56,10 @@ def _sanitize_filename(filename: Optional[str]) -> str:
     return value if value not in {"", ".", ".."} else "attachment"
 
 
+def _normalize_body(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def parse_message(
     raw_message: bytes,
     limits: type[EmailLimits] = EmailLimits,
@@ -82,8 +86,7 @@ def parse_message(
         disposition = part.get_content_disposition()
         filename = part.get_filename()
         content_type = part.get_content_type()
-        payload = part.get_payload(decode=True)
-        payload = payload or b""
+        payload = part.get_payload(decode=True) or b""
 
         if disposition in {"attachment", "inline"} or filename:
             if len(attachments) >= limits.MAX_ATTACHMENTS_PER_MESSAGE:
@@ -105,14 +108,14 @@ def parse_message(
 
         if content_type == "text/plain" and body_plain is None:
             try:
-                body_plain = part.get_content()
+                body_plain = _normalize_body(part.get_content())
             except (LookupError, UnicodeError):
-                body_plain = payload.decode("utf-8", errors="replace")
+                body_plain = _normalize_body(payload.decode("utf-8", errors="replace"))
         elif content_type == "text/html" and body_html is None:
             try:
-                body_html = part.get_content()
+                body_html = _normalize_body(part.get_content())
             except (LookupError, UnicodeError):
-                body_html = payload.decode("utf-8", errors="replace")
+                body_html = _normalize_body(payload.decode("utf-8", errors="replace"))
 
     if body_plain is not None:
         limits.validate_body_length(len(body_plain), full=True)
