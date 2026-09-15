@@ -13,24 +13,38 @@ from typing import Optional
 from .limits import EmailLimits
 
 
-class EmailAddress:
-    """Normalized email address with optional display name.
+@dataclass
+class EmailServerConfig:
+    """Non-secret IMAP/SMTP connection configuration for an email account."""
+    imap_host: str
+    imap_port: int = 993
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    imap_security: str = "ssl"
+    smtp_security: str = "starttls"
 
-    Normalization rules (provider-neutral):
-    - Surrounding whitespace is stripped
-    - Domain portion is lowercased (domains are case-insensitive per RFC 4343)
-    - Local part casing is preserved (case-sensitive per RFC 5321 in many contexts)
-    """
+    def __post_init__(self) -> None:
+        if not self.imap_host or not self.imap_host.strip():
+            raise ValueError("imap_host must not be empty")
+        if self.imap_port <= 0 or self.imap_port > 65535:
+            raise ValueError("imap_port must be between 1 and 65535")
+        if self.smtp_port is not None and (self.smtp_port <= 0 or self.smtp_port > 65535):
+            raise ValueError("smtp_port must be between 1 and 65535")
+        if self.imap_security not in {"ssl", "starttls", "plain"}:
+            raise ValueError("imap_security must be ssl, starttls, or plain")
+        if self.smtp_security not in {"ssl", "starttls", "plain"}:
+            raise ValueError("smtp_security must be ssl, starttls, or plain")
+
+
+class EmailAddress:
+    """Normalized email address with optional display name."""
 
     def __init__(self, address: str, name: str = "") -> None:
         address = address.strip()
-        # Split into local and domain parts
         if "@" in address:
             local, domain = address.rsplit("@", 1)
-            # Preserve local part casing, lowercase domain
             self.address = f"{local}@{domain.lower()}"
         else:
-            # No @ symbol — treat as-is but still strip
             self.address = address.lower()
         self.name = name.strip() if name else ""
 
@@ -46,7 +60,6 @@ class EmailAddress:
         return hash(self.address)
 
     def format(self) -> str:
-        """Return 'Name <address>' or just 'address'."""
         if self.name:
             return f"{self.name} <{self.address}>"
         return self.address
@@ -63,37 +76,35 @@ class OperationStatus(Enum):
 class EmailAccount:
     """Stable account metadata — no secrets stored here."""
     account_id: str
-    provider: str  # e.g. "imap_smtp", "gmail_oauth", "microsoft_graph"
+    provider: str
     display_name: str = ""
     primary_address: Optional[EmailAddress] = None
     aliases: list[EmailAddress] = field(default_factory=list)
     enabled: bool = True
     capabilities: list[str] = field(default_factory=list)
+    server_config: Optional[EmailServerConfig] = None
 
     def __post_init__(self) -> None:
-        if self.primary_address is not None and not isinstance(
-            self.primary_address, EmailAddress
-        ):
+        if self.primary_address is not None and not isinstance(self.primary_address, EmailAddress):
             self.primary_address = EmailAddress(self.primary_address)
-        self.aliases = [
-            a if isinstance(a, EmailAddress) else EmailAddress(a)
-            for a in self.aliases
-        ]
+        self.aliases = [a if isinstance(a, EmailAddress) else EmailAddress(a) for a in self.aliases]
+        if self.server_config is not None and not isinstance(self.server_config, EmailServerConfig):
+            if isinstance(self.server_config, dict):
+                self.server_config = EmailServerConfig(**self.server_config)
+            else:
+                raise TypeError("server_config must be EmailServerConfig or dict")
 
 
 @dataclass
 class EmailMessageRef:
     """Immutable reference to a message — uses UID-based identity."""
     account_id: str
-    mailbox: str  # provider-native mailbox name (e.g. "INBOX")
-    uid: str  # immutable provider UID
-    provider_native_id: Optional[str] = None  # optional legacy ID
+    mailbox: str
+    uid: str
+    provider_native_id: Optional[str] = None
 
     def __repr__(self) -> str:
-        return (
-            f"EmailMessageRef(account={self.account_id!r}, mailbox={self.mailbox!r}, "
-            f"uid={self.uid!r})"
-        )
+        return f"EmailMessageRef(account={self.account_id!r}, mailbox={self.mailbox!r}, uid={self.uid!r})"
 
 
 @dataclass
@@ -103,9 +114,8 @@ class EmailAttachment:
     filename: str
     content_type: str
     byte_size: int
-    disposition: str = "attachment"  # "attachment" or "inline"
+    disposition: str = "attachment"
     content_id: Optional[str] = None
-    # Controlled handle to the content (path or stream reference)
     content_handle: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -122,7 +132,7 @@ class EmailMessage:
     reply_to: Optional[EmailAddress] = None
     subject: str = ""
     date: Optional[datetime] = None
-    flags: list[str] = field(default_factory=list)  # e.g. ["\\Seen", "\\Flagged"]
+    flags: list[str] = field(default_factory=list)
     body_plain: Optional[str] = None
     body_html: Optional[str] = None
     attachments: list[EmailAttachment] = field(default_factory=list)
@@ -140,7 +150,6 @@ class EmailMessage:
 
 @dataclass
 class EmailThread:
-    """Thread of related messages."""
     thread_key: str
     messages: list[EmailMessageRef] = field(default_factory=list)
     subject: str = ""
@@ -154,17 +163,15 @@ class EmailThread:
 
 @dataclass
 class EmailFolder:
-    """Provider mailbox representation."""
-    provider_name: str  # e.g. "INBOX", "Sent", "Drafts"
+    provider_name: str
     display_name: str = ""
     selectable: bool = True
     read_only: bool = False
-    special_use: Optional[str] = None  # e.g. "\\Drafts", "\\Sent", "\\Trash"
+    special_use: Optional[str] = None
 
 
 @dataclass
 class EmailDraft:
-    """Draft message state."""
     draft_id: Optional[str] = None
     reference: Optional[EmailMessageRef] = None
     recipients: list[EmailAddress] = field(default_factory=list)
@@ -174,18 +181,15 @@ class EmailDraft:
     attachments: list[EmailAttachment] = field(default_factory=list)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    state: str = "draft"  # "draft", "sent"
+    state: str = "draft"
 
     def __post_init__(self) -> None:
-        if self.reference is not None and not isinstance(
-            self.reference, EmailMessageRef
-        ):
+        if self.reference is not None and not isinstance(self.reference, EmailMessageRef):
             raise TypeError("reference must be an EmailMessageRef")
 
 
 @dataclass
 class EmailSearchQuery:
-    """Structured search criteria — provider-neutral."""
     sender: Optional[str] = None
     recipients: Optional[list[str]] = None
     subject: Optional[str] = None
@@ -196,10 +200,10 @@ class EmailSearchQuery:
     flags: Optional[list[str]] = None
     thread_id: Optional[str] = None
     has_attachment: Optional[bool] = None
-    limit: Optional[int] = None  # None = use default, 0 = invalid
+    limit: Optional[int] = None
     offset: int = 0
-    sort_by: str = "date"  # "date", "relevance"
-    sort_order: str = "desc"  # "asc", "desc"
+    sort_by: str = "date"
+    sort_order: str = "desc"
 
     def __post_init__(self) -> None:
         if self.limit is not None and self.limit < 0:
@@ -211,7 +215,6 @@ class EmailSearchQuery:
 
     @property
     def resolved_limit(self) -> int:
-        """Return the effective limit after applying defaults and caps."""
         if self.limit is None:
             return EmailLimits.DEFAULT_READ_LIMIT
         return min(self.limit, EmailLimits.MAX_SEARCH_RESULTS)
@@ -219,7 +222,6 @@ class EmailSearchQuery:
 
 @dataclass
 class EmailOperationResult:
-    """Result of an email operation."""
     operation_id: str
     status: OperationStatus
     affected_refs: list[EmailMessageRef] = field(default_factory=list)
