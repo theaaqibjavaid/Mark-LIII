@@ -34,8 +34,10 @@ cryptography
 python-multipart
 qrcode[pil]
 
-# ── Plugin extras: Gmail / Google Calendar (OAuth) ────────────────────────────
-google-api-python-client
+# ── Email Engine: secure OS credential storage + OAuth ────────────────────────
+keyring
+# Gmail OAuth/API
+ google-api-python-client
 google-auth-oauthlib
 
 # ── Plugin extras: Tuya / Smart Life smart light (home_assistant) ─────────────
@@ -52,7 +54,7 @@ wmi;        sys_platform == "win32"
 # ── Optional: local wake word ("Hey Jarvis") ──────────────────────────────────
 # Deliberately NOT installed by default — it's opt-in. Enable it (and download
 # the tiny model) with one click from ⚙ → WAKE WORD in the app, or install it
-# yourself with:  pip install openwakeword
+# yourself with: pip install openwakeword
 #
 # macOS / Linux OS actions (volume, brightness, reminders) shell out to native
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python
