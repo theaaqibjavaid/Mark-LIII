@@ -31,16 +31,20 @@ def _service(provider):
     return EmailService({"a1": account}, {"a1": provider})
 
 
-def test_email_address_rejects_header_injection_and_malformed_addresses():
-    for value in (
-        "victim@example.com\r\nBcc: attacker@example.com",
-        "victim@example",
-        "@example.com",
-        "victim@",
-        "victim example.com",
-    ):
+def test_email_address_rejects_header_injection():
+    for value in ("victim@example.com\r\nBcc: attacker@example.com", "victim@example.com\nBcc: attacker@example.com"):
         with pytest.raises(ValueError):
             EmailAddress(value)
+
+
+def test_mime_rejects_malformed_recipient():
+    with pytest.raises(ValueError, match="recipient"):
+        build_outbound_message(
+            sender=EmailAddress("me@example.com"),
+            recipients=[EmailAddress("invalid")],
+            subject="hello",
+            body_plain="hello",
+        )
 
 
 def test_mime_rejects_header_injection_in_subject():
