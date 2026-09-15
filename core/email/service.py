@@ -1,6 +1,7 @@
 """Action-facing orchestration boundary for the Email Engine."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -31,6 +32,7 @@ class EmailService:
     def __init__(self, accounts: Mapping[str, EmailAccount], providers: Mapping[str, Any], *, policy=EmailPolicy, idempotency_store: Optional[IdempotencyStore] = None) -> None:
         self._accounts = dict(accounts); self._providers = dict(providers); self._policy = policy
         self._idempotency = idempotency_store or InMemoryIdempotencyStore()
+        self._send_locks: dict[str, asyncio.Lock] = {}
 
     def account_metadata(self, account_id: str) -> dict[str, Any]:
         account = self._accounts.get(account_id)
@@ -112,19 +114,21 @@ class EmailService:
         account, provider = self._provider(account_id); self._require(provider, Capability.SEND)
         if self._policy.requires_confirmation(OperationCategory.SEND) and not confirmed: raise PermissionError("Confirmation required before sending email")
         op_id = operation_id or str(uuid.uuid4())
-        payload = {"account_id": account_id, "to": to, "cc": cc, "bcc": bcc, "subject": subject, "body_plain": body_plain, "body_html": body_html, "attachments": attachments, "reply_to": reply_to}
-        record = self._idempotency.begin(op_id, _fingerprint(payload))
-        if record.status in {"success", "unknown"}: return record.result
-        try:
-            result = await provider.send(account=account, to=list(to), subject=subject, body_plain=body_plain, body_html=body_html, attachments=attachments or [], cc=list(cc or []), bcc=list(bcc or []), reply_to=reply_to)
-        except Exception:
-            result = EmailOperationResult(op_id, OperationStatus.UNKNOWN, warnings=["Send completion is ambiguous; reconcile before retrying"], error="Email send completion is ambiguous", error_code="send_unknown")
-            self._idempotency.mark_unknown(op_id, result); return result
-        if isinstance(result, EmailOperationResult):
-            if result.operation_id != op_id: result = replace(result, operation_id=op_id)
-            if result.status == OperationStatus.UNKNOWN:
+        lock = self._send_locks.setdefault(op_id, asyncio.Lock())
+        async with lock:
+            payload = {"account_id": account_id, "to": to, "cc": cc, "bcc": bcc, "subject": subject, "body_plain": body_plain, "body_html": body_html, "attachments": attachments, "reply_to": reply_to}
+            record = self._idempotency.begin(op_id, _fingerprint(payload))
+            if record.status in {"success", "unknown"}: return record.result
+            try:
+                result = await provider.send(account=account, to=list(to), subject=subject, body_plain=body_plain, body_html=body_html, attachments=attachments or [], cc=list(cc or []), bcc=list(bcc or []), reply_to=reply_to)
+            except Exception:
+                result = EmailOperationResult(op_id, OperationStatus.UNKNOWN, warnings=["Send completion is ambiguous; reconcile before retrying"], error="Email send completion is ambiguous", error_code="send_unknown")
                 self._idempotency.mark_unknown(op_id, result); return result
-        self._idempotency.complete(op_id, result); return result
+            if isinstance(result, EmailOperationResult):
+                if result.operation_id != op_id: result = replace(result, operation_id=op_id)
+                if result.status == OperationStatus.UNKNOWN:
+                    self._idempotency.mark_unknown(op_id, result); return result
+            self._idempotency.complete(op_id, result); return result
 
     async def reply(self, account_id: str, ref: EmailMessageRef, *, body_plain: Optional[str] = None, body_html: Optional[str] = None, confirmed: bool = False, operation_id: Optional[str] = None):
         return await self._unsupported_composed(account_id, ref, OperationCategory.REPLY, Capability.REPLY, confirmed)
