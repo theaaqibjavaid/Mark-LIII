@@ -3,20 +3,16 @@ from __future__ import annotations
 
 from .email_common import configure, error, ok, service, validate, nonempty
 
-LEGACY_ALIASES = ("configure_email", "email_config", "email_account")
+LEGACY_ALIASES = ("email", "configure_email", "email_config", "email_account")
 
 
 def _handler(parameters=None, **_):
     try:
         p = validate(parameters, {"operation", "account_id"}, {"operation"})
         operation = nonempty(p["operation"], "operation").lower()
-        if operation == "metadata":
-            account_id = nonempty(p.get("account_id"), "account_id")
-            account = service()._accounts.get(account_id)
-            if account is None:
-                raise KeyError(account_id)
-            return ok({"account_id": account.account_id, "provider": account.provider, "display_name": account.display_name, "primary_address": account.primary_address.format() if account.primary_address else None, "aliases": [a.format() for a in account.aliases], "enabled": account.enabled, "capabilities": list(account.capabilities)})
-        raise ValueError("Unsupported account operation")
+        if operation != "metadata": raise ValueError("Unsupported account operation")
+        account_id = nonempty(p.get("account_id"), "account_id")
+        return ok(service().account_metadata(account_id))
     except Exception as exc:
         return error(exc)
 

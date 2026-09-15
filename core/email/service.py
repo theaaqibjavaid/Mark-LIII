@@ -32,6 +32,18 @@ class EmailService:
         self._accounts = dict(accounts); self._providers = dict(providers); self._policy = policy
         self._idempotency = idempotency_store or InMemoryIdempotencyStore()
 
+    def account_metadata(self, account_id: str) -> dict[str, Any]:
+        account = self._accounts.get(account_id)
+        if account is None: raise KeyError(f"Unknown email account: {account_id}")
+        return {"account_id": account.account_id, "provider": account.provider, "display_name": account.display_name,
+                "primary_address": account.primary_address.format() if account.primary_address else None,
+                "aliases": [a.format() for a in account.aliases], "enabled": account.enabled,
+                "capabilities": list(account.capabilities)}
+
+    async def list_folders(self, account_id: str):
+        _, provider = self._provider(account_id); self._require(provider, Capability.FOLDERS)
+        return await provider.list_folders()
+
     def _provider(self, account_id: str) -> tuple[EmailAccount, Any]:
         account = self._accounts.get(account_id); provider = self._providers.get(account_id)
         if account is None or provider is None: raise KeyError(f"Unknown email account: {account_id}")
