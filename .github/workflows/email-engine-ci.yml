@@ -9,7 +9,7 @@ on:
       - "**"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -22,18 +22,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Repair missing send limit validations
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('core/email/providers/imap_smtp.py')
-          s = p.read_text()
-          old = '''        recipients = list(to) + list(cc or []) + list(bcc or [])\n        if not recipients or any("@" not in r.address for r in recipients): raise InvalidRecipientError("Invalid or missing recipient")\n        if len(attachments or []) > EmailLimits.MAX_ATTACHMENTS_PER_MESSAGE: raise AttachmentTooLargeError("Attachment count exceeds limit")'''
-          new = '''        recipients = list(to) + list(cc or []) + list(bcc or [])\n        if not recipients or any("@" not in r.address for r in recipients): raise InvalidRecipientError("Invalid or missing recipient")\n        try:\n            EmailLimits.validate_recipient_count(len(recipients))\n        except ValueError as exc:\n            raise InvalidRecipientError("Recipient count exceeds limit") from exc\n        EmailLimits.validate_subject_length(len(subject))\n        if len(attachments or []) > EmailLimits.MAX_ATTACHMENTS_PER_MESSAGE: raise AttachmentTooLargeError("Attachment count exceeds limit")'''
-          if old in s:
-              p.write_text(s.replace(old, new, 1))
-          PY
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -60,16 +48,6 @@ jobs:
           xvfb-run -a coverage run --source=core/email -m pytest -q tests/email
           coverage report --fail-under=80
           coverage xml -o coverage.xml
-
-      - name: Persist provider repair
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add core/email/providers/imap_smtp.py
-          if ! git diff --cached --quiet; then
-            git commit -m 'fix: enforce email send limits'
-            git push
-          fi
 
       - name: Upload coverage report
         if: always()
