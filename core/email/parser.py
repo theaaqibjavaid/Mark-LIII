@@ -34,11 +34,7 @@ def _decode(value: Optional[str]) -> str:
 def _addresses(value: Optional[str]) -> list[EmailAddress]:
     if not value:
         return []
-    result = []
-    for name, address in getaddresses([value]):
-        if address:
-            result.append(EmailAddress(address, _decode(name)))
-    return result
+    return [EmailAddress(address, _decode(name)) for name, address in getaddresses([value]) if address]
 
 
 def _date(value: Optional[str]) -> Optional[datetime]:
@@ -60,18 +56,18 @@ def _normalize_body(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def parse_message(
-    raw_message: bytes,
-    limits: type[EmailLimits] = EmailLimits,
-    *,
-    reference: Optional[EmailMessageRef] = None,
-) -> EmailMessage:
-    """Parse a complete MIME message without executing or interpreting payloads."""
+def _canonical_content_id(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return f"<{value.strip('<>')}>"
+
+
+def parse_message(raw_message: bytes, limits: type[EmailLimits] = EmailLimits, *, reference: Optional[EmailMessageRef] = None) -> EmailMessage:
+    """Parse MIME safely; payloads are data only and are never executed."""
     if not isinstance(raw_message, bytes):
         raise TypeError("raw_message must be bytes")
     limits.validate_message_size(len(raw_message))
     msg = BytesParser(policy=policy.default).parsebytes(raw_message)
-
     ref = reference or EmailMessageRef(account_id="unknown", mailbox="unknown", uid="unknown")
     sender = (_addresses(msg.get("From")) or [EmailAddress("")])[0]
     recipients = _addresses(msg.get("To")) + _addresses(msg.get("Cc"))
@@ -87,25 +83,21 @@ def parse_message(
         filename = part.get_filename()
         content_type = part.get_content_type()
         payload = part.get_payload(decode=True) or b""
-
         if disposition in {"attachment", "inline"} or filename:
             if len(attachments) >= limits.MAX_ATTACHMENTS_PER_MESSAGE:
                 raise ValueError("Attachment count exceeds configured limit")
             limits.validate_attachment_size(len(payload))
             attachment_total += len(payload)
             limits.validate_total_attachment_size(attachment_total)
-            attachments.append(
-                EmailAttachment(
-                    attachment_id=f"part-{len(attachments) + 1}",
-                    filename=_sanitize_filename(filename),
-                    content_type=content_type,
-                    byte_size=len(payload),
-                    disposition=disposition or "attachment",
-                    content_id=part.get("Content-ID"),
-                )
-            )
+            attachments.append(EmailAttachment(
+                attachment_id=f"part-{len(attachments) + 1}",
+                filename=_sanitize_filename(filename),
+                content_type=content_type,
+                byte_size=len(payload),
+                disposition=disposition or "attachment",
+                content_id=_canonical_content_id(part.get("Content-ID")),
+            ))
             continue
-
         if content_type == "text/plain" and body_plain is None:
             try:
                 body_plain = _normalize_body(part.get_content())
@@ -121,7 +113,6 @@ def parse_message(
         limits.validate_body_length(len(body_plain), full=True)
     if body_html is not None:
         limits.validate_body_length(len(body_html), full=True)
-
     return EmailMessage(
         reference=ref,
         sender=sender,
