@@ -37,6 +37,7 @@ from typing import Callable, Optional
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
 _CTX_KEYS = ("player", "speak", "response", "session_memory")
+_SCHEMA_TYPES = {"OBJECT", "ARRAY", "STRING", "INTEGER", "NUMBER", "BOOLEAN"}
 
 
 @dataclass
@@ -95,6 +96,44 @@ def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:
     return fn(parameters=parameters, **kwargs)
 
 
+def _validate_schema(schema: dict, path: str) -> str | None:
+    """Validate the subset of Gemini function schemas used by built-in actions.
+
+    In particular, Gemini requires every ARRAY declaration to provide an
+    ``items`` schema. Validation is recursive so nested arrays/objects cannot
+    reach the Live API in an invalid form.
+    """
+    if not isinstance(schema, dict):
+        return f"{path} must be an object"
+    schema_type = schema.get("type")
+    if schema_type not in _SCHEMA_TYPES:
+        return f'{path}.type must be one of {sorted(_SCHEMA_TYPES)}'
+
+    if schema_type == "ARRAY":
+        if not isinstance(schema.get("items"), dict):
+            return f"{path}.items is required for ARRAY schemas"
+        return _validate_schema(schema["items"], f"{path}.items")
+
+    if schema_type == "OBJECT":
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return f"{path}.properties must be an object"
+        for name, child in properties.items():
+            if not isinstance(name, str) or not name:
+                return f"{path}.properties contains an invalid property name"
+            error = _validate_schema(child, f"{path}.properties[{name!r}]")
+            if error:
+                return error
+        required = schema.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+            return f"{path}.required must be an array of strings"
+        unknown_required = [item for item in required if item not in properties]
+        if unknown_required:
+            return f"{path}.required contains unknown properties: {unknown_required}"
+
+    return None
+
+
 def _validate(module, filename: str) -> ActionRecord:
     """Returns an ActionRecord; .valid=False + .error set on any problem. Never raises."""
     tool = getattr(module, "TOOL", None)
@@ -116,6 +155,10 @@ def _validate(module, filename: str) -> ActionRecord:
     if not isinstance(parameters, dict) or parameters.get("type") != "OBJECT":
         return ActionRecord(name=name, file=filename,
                             error="TOOL['parameters'] must be a dict with \"type\": \"OBJECT\".")
+
+    schema_error = _validate_schema(parameters, "TOOL['parameters']")
+    if schema_error:
+        return ActionRecord(name=name, file=filename, error=schema_error)
 
     handler = tool.get("handler")
     if not callable(handler):
@@ -146,8 +189,6 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
             continue
         try:
             module_name = f"actions.{path.stem}"
-            # Reuse the already-imported module when present so handlers are the
-            # same objects the rest of the app holds.
             module = sys.modules.get(module_name)
             if module is None:
                 spec = importlib.util.spec_from_file_location(module_name, path)
@@ -162,7 +203,7 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
                     raise
 
             if getattr(module, "TOOL", None) is None:
-                continue   # not an action file — a helper/capture-only module
+                continue
 
             rec = _validate(module, path.name)
 
@@ -184,7 +225,6 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
             valid[rec.name] = rec
             logger(f"Action loaded: {rec.name} ({path.name})")
         else:
-            # Only log a rejection if the file actually tried to be an action.
             logger(f"Action rejected: {path.name} — {rec.error}")
 
     registry = ActionRegistry(valid, logger)
