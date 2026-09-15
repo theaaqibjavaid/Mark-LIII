@@ -1,9 +1,9 @@
-"""Small, provider-neutral idempotency store for high-impact email operations."""
+"""Provider-neutral idempotency store for high-impact email operations."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,7 @@ class IdempotencyRecord:
     result: Any = None
 
 
+@runtime_checkable
 class IdempotencyStore(Protocol):
     def begin(self, operation_id: str, fingerprint: str) -> IdempotencyRecord: ...
     def get(self, operation_id: str) -> Optional[IdempotencyRecord]: ...
